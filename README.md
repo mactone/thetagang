@@ -1,6 +1,65 @@
-[![Docker publish](https://github.com/brndnmtthws/thetagang/workflows/Docker%20publish/badge.svg)](https://hub.docker.com/r/brndnmtthws/thetagang) [![Python Publish](https://github.com/brndnmtthws/thetagang/workflows/Python%20Publish/badge.svg)](https://pypi.org/project/thetagang/) [![Docker Pulls](https://img.shields.io/docker/pulls/brndnmtthws/thetagang)](https://hub.docker.com/r/brndnmtthws/thetagang) [![PyPI download month](https://img.shields.io/pypi/dm/thetagang?label=PyPI%20downloads)](https://pypi.python.org/pypi/thetagang/)
+# Θ ThetaGang (Mactone Fork with Telegram Bot) Θ
 
-[💬 Join the Matrix chat, we can get money together](https://matrix.to/#/#thetagang:frens.io).
+這個分支新增了與 `deribit-thetagang` 相似的 **Telegram Bot 操控與動態管理功能**，方便隨時掌握帳戶狀況與手動風控。
+
+---
+
+## 🚀 快速開始：透過 Docker 建置與啟動
+
+### 1. 本地建置 Docker 鏡像
+由於 Dockerfile 會將本地打包好的 wheel 安裝進鏡像中，在建置前需要先打包：
+```bash
+# 使用 uv 打包 (推薦)
+uv build
+
+# 或使用 python 官方 build 工具
+pip install build && python -m build
+
+# 接著建置 Docker 鏡像
+docker build -t thetagang .
+```
+
+### 2. 啟動交易機器人 (Trading Bot)
+掛載包含 `thetagang.toml` 的設定檔目錄，並執行交易邏輯（由外部排程如 cron 每 30 分鐘執行一次）：
+```bash
+docker run --rm -i \
+  -v /path/to/local/thetagang/config:/etc/thetagang \
+  thetagang \
+  --config /etc/thetagang/thetagang.toml
+```
+
+### 3. 啟動 Telegram Bot 背景守護進程 (Telegram Bot Daemon)
+Telegram Bot 需要持續在背景運行以接收指令，請使用 `-d` 在背景啟動並傳入 `--bot` 參數：
+```bash
+docker run -d --name thetagang-bot \
+  -v /path/to/local/thetagang/config:/etc/thetagang \
+  thetagang \
+  --config /etc/thetagang/thetagang.toml --bot
+```
+
+---
+
+## 🛠️ 修改項目與功能說明
+
+### 1. 修改項目
+- **新增 Telegram 支援**：在 `thetagang.toml` 的 `[runtime.telegram]` 區塊配置 Token 與 Chat ID。
+- **動態交易開關**：引入動態暫停狀態機制。使用 `/pause` 與 `/resume` 指令會動態寫入 `telegram_bot_state.json`。主交易程式執行時會自動載入該狀態，無須重啟容器或修改 TOML 設定檔。
+- **CLI 模式切換**：新增 `--bot` 啟動參數，用於啟用長連接的 Telegram Bot。
+- **依賴升級**：`pyproject.toml` 中新增 `python-telegram-bot` 依賴。
+
+### 2. Telegram Bot 指令說明
+| 指令 | 說明 |
+|------|------|
+| `/start` | 顯示 Bot 指令選單 |
+| `/status` | 顯示即時 Net Liquidation、可用現金、保證金需求與 Cushion 比例 |
+| `/positions` | 列出目前所有股票與期權持倉，附帶 conId、成本、市值與未實現盈虧 |
+| `/trades` | 查詢 SQLite 資料庫，顯示最近 30 筆交易成交紀錄 |
+| `/strategy` | 顯示各標的的權重分配以及當前是否被暫停交易 |
+| `/pause <symbol\|all>` | 暫停單一標的或全域自動交易 |
+| `/resume <symbol\|all>` | 恢復單一標的或全域自動交易 |
+| `/close <conId\|symbol>` | 發送市價單手動平倉指定持倉 |
+
+---
 
 # Θ ThetaGang Θ
 
