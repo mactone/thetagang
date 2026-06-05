@@ -770,6 +770,21 @@ class PortfolioManager:
                 self.orders.print_summary()
             else:
                 self.submit_orders()
+                try:
+                    placed_trades = self.trades.records()
+                    if placed_trades:
+                        lines = ["🔔 <b>ThetaGang 下單通知 (Order Placed)</b>"]
+                        for trade in placed_trades:
+                            contract = trade.contract
+                            order = trade.order
+                            lines.append(
+                                f"• {order.action} {order.totalQuantity} <b>{contract.symbol}</b> "
+                                f"@ ${order.lmtPrice or 'MKT'} (Ref: {order.orderRef or '-'})"
+                            )
+                        message = "\n".join(lines)
+                        send_telegram_notification(self.config, message)
+                except Exception as exc:
+                    log.warning(f"Failed to generate Telegram order notification: {exc}")
 
                 try:
                     await self.ibkr.wait_for_submitting_orders(self.trades.records())
@@ -1219,3 +1234,23 @@ class PortfolioManager:
             right,
         )
         return (threshold_perc * close_price, absolute_daily_change)
+
+
+def send_telegram_notification(config, text: str) -> None:
+    if not config.telegram.enabled or not config.telegram.bot_token or not config.telegram.chat_id:
+        return
+    import urllib.request
+    import urllib.parse
+    try:
+        url = f"https://api.telegram.org/bot{config.telegram.bot_token}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": config.telegram.chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }).encode('utf-8')
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            response.read()
+    except Exception as exc:
+        log.warning(f"Telegram notification failed: {exc}")
+
