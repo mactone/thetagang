@@ -525,3 +525,39 @@ def test_v2_rejects_transitional_infrastructure_key() -> None:
                 },
             }
         )
+
+
+def test_telegram_config_parsing() -> None:
+    data = _base_config({"strategies": ["wheel"]})
+    data["runtime"]["telegram"] = {
+        "enabled": True,
+        "bot_token": "123456:ABC-DEF",
+        "chat_id": "987654321",
+    }
+    config = Config(**data)
+    assert config.telegram.enabled is True
+    assert config.telegram.bot_token == "123456:ABC-DEF"
+    assert config.telegram.chat_id == "987654321"
+
+
+def test_trading_is_allowed_with_telegram_pause(tmp_path) -> None:
+    import json
+    data = _base_config({"strategies": ["wheel"]})
+    db_file = tmp_path / "thetagang.db"
+    data["runtime"]["database"] = {"enabled": True, "path": str(db_file)}
+    
+    config = Config(**data)
+    assert config.trading_is_allowed("AAA") is True
+    
+    state_file = tmp_path / "telegram_bot_state.json"
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({"paused_all": False, "paused_symbols": ["AAA"]}, f)
+        
+    assert config.trading_is_allowed("AAA") is False
+    assert config.trading_is_allowed("BBB") is True
+    
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({"paused_all": True, "paused_symbols": []}, f)
+        
+    assert config.trading_is_allowed("BBB") is False
+

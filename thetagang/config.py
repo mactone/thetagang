@@ -27,6 +27,7 @@ from thetagang.config_models import (
     RollWhenConfig,
     SymbolConfig,
     TargetConfig,
+    TelegramConfig,
     VIXCallHedgeConfig,
     WatchdogConfig,
     WriteWhenConfig,
@@ -255,6 +256,7 @@ class RuntimeConfig(BaseModel):
     ib_async: IBAsyncConfig = Field(default_factory=IBAsyncConfig)
     ibc: IBCConfig = Field(default_factory=IBCConfig)
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
 
 
 class PortfolioConfig(BaseModel):
@@ -487,6 +489,10 @@ class Config(BaseModel, DisplayMixin):
         return self.runtime.watchdog
 
     @property
+    def telegram(self) -> TelegramConfig:
+        return self.runtime.telegram
+
+    @property
     def symbols(self) -> Dict[str, SymbolConfig]:
         return self.portfolio.symbols
 
@@ -542,7 +548,32 @@ class Config(BaseModel, DisplayMixin):
 
     def trading_is_allowed(self, symbol: str) -> bool:
         symbol_config = self.symbols.get(symbol)
-        return not symbol_config or not symbol_config.no_trading
+        if symbol_config and symbol_config.no_trading:
+            return False
+
+        # Check dynamic pause state from Telegram bot
+        try:
+            import json
+            from pathlib import Path
+            state_paths = [
+                Path(self.database.path).parent / "telegram_bot_state.json",
+                Path("data/telegram_bot_state.json"),
+                Path("telegram_bot_state.json")
+            ]
+            for p in state_paths:
+                if p.exists():
+                    with open(p, "r", encoding="utf-8") as f:
+                        state = json.load(f)
+                    if state.get("paused_all", False):
+                        return False
+                    paused_symbols = state.get("paused_symbols", [])
+                    if symbol in paused_symbols:
+                        return False
+                    break
+        except Exception:
+            pass
+
+        return True
 
     def is_buy_only_rebalancing(self, symbol: str) -> bool:
         policy = self.wheel_rebalance_policy(symbol)

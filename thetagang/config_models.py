@@ -690,3 +690,19 @@ class ExchangeHoursConfig(BaseModel, DisplayMixin):
         table.add_row("", "Delay after open", "=", f"{self.delay_after_open}s")
         table.add_row("", "Delay before close", "=", f"{self.delay_before_close}s")
         table.add_row("", "Max wait until open", "=", f"{self.max_wait_until_open}s")
+
+
+class TelegramConfig(BaseModel, DisplayMixin):
+    enabled: bool = Field(default=False)
+    bot_token: Optional[str] = Field(default=None)
+    chat_id: Optional[str] = Field(default=None)
+
+    def add_to_table(self, table: Table, section: str = "") -> None:
+        table.add_section()
+        table.add_row("[spring_green1]Telegram Bot")
+        table.add_row("", "Enabled", "=", f"{self.enabled}")
+        if self.bot_token:
+            masked = self.bot_token[:8] + "..." + self.bot_token[-8:] if len(self.bot_token) > 16 else "..."
+            table.add_row("", "Bot Token", "=", masked)
+        table.add_row("", "Chat ID", "=", self.chat_id or "-")
+

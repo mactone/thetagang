@@ -43,12 +43,18 @@ CONTEXT_SETTINGS = dict(
     is_flag=True,
     help="Automatically approve config migration prompts.",
 )
+@click.option(
+    "--bot",
+    is_flag=True,
+    help="Start the Telegram bot daemon.",
+)
 def cli(
     config: str,
     without_ibc: bool,
     dry_run: bool,
     migrate_config: bool,
     yes: bool,
+    bot: bool,
 ) -> None:
     """ThetaGang is an IBKR bot for collecting money.
 
@@ -63,6 +69,11 @@ def cli(
         logging.getLogger("alembic.runtime.migration").setLevel(logging.WARNING)
         logging.getLogger("ib_async").setLevel(logging.WARNING)
         logging.getLogger("ib_async.client").setLevel(logging.WARNING)
+
+    if bot:
+        from .telegram_bot import start_bot
+        start_bot(config_path=config)
+        return
 
     from thetagang.config_migration.startup_migration import (
         InvalidMigrationOptionError,
