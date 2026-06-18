@@ -2,8 +2,22 @@
 ibc.log
 tws-installer.sh
 .idea/
-# local configuration
+# local configuration / secrets
+# Keep the checked-in sample/template config separate from real trading config.
+thetagang.toml
 thetagang.local.toml
+thetagang.*.toml
+*.local.toml
+*.secret.toml
+*.secrets.toml
+*.bak
+*.bak-*
+
+# Runtime data / logs
+data/*.db
+data/*.db-*
+data/*.db.bak-*
+*.log
 
 # Ignore tws installer dir
 tws/

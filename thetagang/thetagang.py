@@ -89,12 +89,13 @@ def start(
 
     _configure_ib_async_logging(config.runtime.ib_async.logfile)
 
-    # Check if exchange is open before continuing
-    if need_to_exit(config.runtime.exchange_hours):
-        return
-
     async def onConnected() -> None:
         log.info(f"Connected to IB Gateway, serverVersion={ib.client.serverVersion()}")
+        # Keep IB Gateway/API online even before exchange start so auxiliary
+        # clients (Telegram /status, /positions, etc.) can connect to 7497.
+        # Trading logic still respects exchange_hours and waits/exits here.
+        if need_to_exit(config.runtime.exchange_hours):
+            return
         await portfolio_manager.manage()
 
     ib = IB()
@@ -175,7 +176,17 @@ def start(
         async def run_with_watchdog() -> None:
             watchdog.start()
             try:
-                await completion_future
+                while True:
+                    try:
+                        await asyncio.shield(completion_future)
+                        break
+                    except asyncio.CancelledError:
+                        if completion_future.done():
+                            break
+                        log.warning(
+                            "Connection cancelled (likely IBKR daily reset) — waiting for Watchdog to reconnect..."
+                        )
+                        await asyncio.sleep(2)
             finally:
                 watchdog.stop()
                 await ibc.terminateAsync()
