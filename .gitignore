@@ -18,6 +18,7 @@ data/*.db
 data/*.db-*
 data/*.db.bak-*
 *.log
+.thetagang-*.inspect.backup.json
 
 # Ignore tws installer dir
 tws/
@@ -169,3 +170,6 @@ cython_debug/
 
 # Ignore local db for testing
 data/thetagang.db
+
+# IBC credentials (local secret)
+ibc-config.ini
