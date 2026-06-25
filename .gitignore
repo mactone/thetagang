@@ -175,3 +175,9 @@ data/thetagang.db
 
 # IBC credentials (local secret)
 ibc-config.ini
+
+# AI coding-assistant instruction files (local dev only)
+CLAUDE.md
+AGENTS.md
+.github/copilot-instructions.md
+.github/instructions/
