@@ -696,6 +696,8 @@ class TelegramConfig(BaseModel, DisplayMixin):
     enabled: bool = Field(default=False)
     bot_token: Optional[str] = Field(default=None)
     chat_id: Optional[str] = Field(default=None)
+    revenue_start_date: Optional[str] = Field(default=None)
+    initial_fund: Optional[float] = Field(default=None)
 
     def add_to_table(self, table: Table, section: str = "") -> None:
         table.add_section()
@@ -705,4 +707,6 @@ class TelegramConfig(BaseModel, DisplayMixin):
             masked = self.bot_token[:8] + "..." + self.bot_token[-8:] if len(self.bot_token) > 16 else "..."
             table.add_row("", "Bot Token", "=", masked)
         table.add_row("", "Chat ID", "=", self.chat_id or "-")
+        table.add_row("", "Revenue start date", "=", self.revenue_start_date or "year start")
+        table.add_row("", "Initial fund", "=", f"${self.initial_fund:,.0f}" if self.initial_fund else "not set")
 

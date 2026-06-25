@@ -5,6 +5,8 @@ tws-installer.sh
 # local configuration / secrets
 # Keep the checked-in sample/template config separate from real trading config.
 thetagang.toml
+ibc-config.ini
+data/telegram_fill_monitor_state.json
 thetagang.local.toml
 thetagang.*.toml
 *.local.toml

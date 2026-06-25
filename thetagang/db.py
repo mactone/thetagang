@@ -166,6 +166,9 @@ class ExecutionRecord(Base):
     price: Mapped[Optional[float]] = mapped_column(Float)
     execution_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
     exchange: Mapped[Optional[str]] = mapped_column(String)
+    realized_pnl: Mapped[Optional[float]] = mapped_column(Float)
+    sec_type: Mapped[Optional[str]] = mapped_column(String)
+    right: Mapped[Optional[str]] = mapped_column(String)
 
 
 class HistoricalBar(Base):
@@ -495,6 +498,12 @@ class DataStore:
                     execution, "time", None
                 )
                 exec_time = _parse_datetime(exec_time_raw, assume_start_of_day=True)
+                commission_report = getattr(fill, "commissionReport", None)
+                raw_pnl = getattr(commission_report, "realizedPNL", None)
+                # raw_pnl == raw_pnl rejects NaN (ib_async uses NaN when report not yet received)
+                realized_pnl = (
+                    float(raw_pnl) if raw_pnl is not None and raw_pnl == raw_pnl else None
+                )
                 rows.append(
                     dict(
                         run_id=self.run_id,
@@ -507,12 +516,18 @@ class DataStore:
                         price=getattr(execution, "price", None),
                         execution_time=exec_time,
                         exchange=getattr(execution, "exchange", None),
+                        sec_type=getattr(contract, "secType", None),
+                        right=getattr(contract, "right", None) or None,
+                        realized_pnl=realized_pnl,
                     )
                 )
             if rows:
                 with self.session_scope() as session:
                     stmt = sqlite_insert(ExecutionRecord).values(rows)
-                    stmt = stmt.on_conflict_do_nothing(index_elements=["exec_id"])
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["exec_id"],
+                        set_={"realized_pnl": stmt.excluded.realized_pnl},
+                    )
                     session.execute(stmt)
         except Exception as exc:
             log.warning(f"Failed to record executions: {exc}")

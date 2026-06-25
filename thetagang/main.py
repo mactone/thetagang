@@ -72,7 +72,7 @@ def cli(
 
     if bot:
         from .telegram_bot import start_bot
-        start_bot(config_path=config)
+        start_bot(cfg_path=config)
         return
 
     from thetagang.config_migration.startup_migration import (

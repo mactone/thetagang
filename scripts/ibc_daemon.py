@@ -38,22 +38,18 @@ def main() -> None:
 
     ibc_cfg = config.runtime.ibc
     wdog_cfg = config.runtime.watchdog
-    probe_cfg = wdog_cfg.probeContract
 
     ib = IB()
     ibc = IBC(1045, **ibc_cfg.to_dict())
-    probe = Contract(
-        secType=probe_cfg.secType,
-        symbol=probe_cfg.symbol,
-        currency=probe_cfg.currency,
-        exchange=probe_cfg.exchange,
-    )
 
     # clientId=98 — distinct from trading engine (1) and Telegram bot (99).
+    # probeContract omitted: the HMDS midpoint probe (Error 162) caused the
+    # Watchdog to declare Hard timeout and kill TWS on every cycle. Connection
+    # health is monitored implicitly via the persistent ib_async connection.
     wdog_kwargs = wdog_cfg.to_dict()
     wdog_kwargs["clientId"] = 98
 
-    watchdog = Watchdog(ibc, ib, probeContract=probe, **wdog_kwargs)
+    watchdog = Watchdog(ibc, ib, **wdog_kwargs)
 
     def on_started(_w: Watchdog) -> None:
         log.info(f"TWS ready on {wdog_cfg.host}:{wdog_cfg.port}")

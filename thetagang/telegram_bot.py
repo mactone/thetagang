@@ -5,6 +5,7 @@ import difflib
 import html
 import logging
 import json
+import secrets
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,21 @@ ORDER_FILL_MONITOR_INTERVAL_SECONDS = 5 * 60
 # Global config variables
 config: Optional[Config] = None
 config_path: Optional[str] = None
+
+# Live-trading safety state is intentionally in-memory: restarting the Telegram
+# daemon disarms live trading and invalidates pending confirmations.
+_live_armed_until: Optional[datetime] = None
+_pending_live_confirmations: dict[str, dict[str, Any]] = {}
+LIVE_CONFIRMATION_TIMEOUT_SECONDS = 5 * 60
+LIVE_ARM_TTL_HOURS = 18
+LIVE_DANGEROUS_COMMANDS = {
+    "apply_config",
+    "buy_leaps",
+    "cancel_order",
+    "close",
+    "modify_order",
+    "resume",
+}
 
 
 def _money(value: float) -> str:
@@ -505,7 +521,7 @@ def _execution_record_cashflow(execution_record: Any) -> Optional[tuple[str, str
     shares = float(getattr(execution_record, "shares", 0) or 0)
     price = float(getattr(execution_record, "price", 0) or 0)
 
-    if sec_type and sec_type != "OPT":
+    if sec_type and sec_type not in ("OPT", "BAG"):
         return None
     if sec_type is None:
         exec_id = str(getattr(execution_record, "exec_id", "") or "")
@@ -525,7 +541,7 @@ def _execution_record_cashflow(execution_record: Any) -> Optional[tuple[str, str
     if isinstance(execution_time, str):
         execution_time = datetime.fromisoformat(execution_time.replace("Z", "+00:00"))
     symbol = getattr(execution_record, "symbol", "-") or "-"
-    return execution_time.strftime("%Y-%m"), symbol, sign * shares * price * 100.0, shares, side
+    return execution_time.strftime("%Y-%m"), symbol, sign * shares * abs(price) * 100.0, shares, side
 
 
 def _format_revenue_message(
@@ -600,26 +616,43 @@ def _format_revenue_message(
         lot["remaining"] = max(0.0, float(lot["remaining"] or 0) - float(record["contracts"] or 0))
         lot["raw_cashflow"] = float(lot["raw_cashflow"] or 0) + abs(float(record["cashflow"]))
 
+    # Realized: use IBKR tax-lot realized_pnl (net P&L after roll costs, not gross cashflow)
     realized_by_month: dict[str, float] = defaultdict(float)
-    unrealized_by_month: dict[str, float] = defaultdict(float)
     realized_by_symbol: dict[str, float] = defaultdict(float)
+    for fill in fills:
+        if not hasattr(fill, "exec_id"):
+            continue
+        rp = getattr(fill, "realized_pnl", None)
+        if rp is None or float(rp) == 0.0:
+            continue
+        exec_time = getattr(fill, "execution_time", None)
+        if not exec_time:
+            continue
+        if isinstance(exec_time, str):
+            exec_time = datetime.fromisoformat(exec_time.replace("Z", "+00:00"))
+        month = exec_time.strftime("%Y-%m")
+        if month < revenue_start_month:
+            continue
+        symbol = getattr(fill, "symbol", "-") or "-"
+        realized_by_month[month] += float(rp)
+        realized_by_symbol[symbol] += float(rp)
+
+    # Pending: open short positions matched to their original SLD records (avg_cost basis)
+    unrealized_by_month: dict[str, float] = defaultdict(float)
     unrealized_by_symbol: dict[str, float] = defaultdict(float)
     for idx, record in enumerate(records):
-        month = record["month"]
+        if idx not in open_row_ids:
+            continue
         symbol = record["symbol"]
         cashflow = float(record["cashflow"])
-        if idx in open_row_ids:
-            lot = open_row_lot[idx]
-            raw_cashflow = float(lot.get("raw_cashflow") or 0)
-            cost_basis = float(lot.get("cost_basis") or 0)
-            scale = cost_basis / raw_cashflow if cost_basis > 0 and raw_cashflow > 0 else 1.0
-            pending_cashflow = cashflow * scale
-            pending_month = open_row_month[idx]
-            unrealized_by_month[pending_month] += pending_cashflow
-            unrealized_by_symbol[symbol] += pending_cashflow
-        else:
-            realized_by_month[month] += cashflow
-            realized_by_symbol[symbol] += cashflow
+        lot = open_row_lot[idx]
+        raw_cashflow = float(lot.get("raw_cashflow") or 0)
+        cost_basis = float(lot.get("cost_basis") or 0)
+        scale = cost_basis / raw_cashflow if cost_basis > 0 and raw_cashflow > 0 else 1.0
+        pending_cashflow = cashflow * scale
+        pending_month = open_row_month[idx]
+        unrealized_by_month[pending_month] += pending_cashflow
+        unrealized_by_symbol[symbol] += pending_cashflow
 
     months = sorted(set(realized_by_month) | set(unrealized_by_month))
     realized_total = sum(realized_by_month.values())
@@ -631,8 +664,7 @@ def _format_revenue_message(
     msg += f"🗓 Revenue start: <b>{revenue_start_label}</b>\n"
     if synced_count is not None:
         msg += f"🔄 IBKR incremental sync returned: <b>{synced_count}</b> option fills\n"
-    msg += "ℹ️ 已平倉=確認收益；未平倉=按到期月份列為待結算，不認列收益。\n"
-    msg += "⚠️ Legacy rows use IBKR execution import + current short-option positions; commissions are included only where IBKR cost basis reflected them.\n\n"
+    msg += "ℹ️ 已實現=IBKR稅務成本淨損益（含roll成本）；未平倉=原始收取premium待結算。\n\n"
 
     msg += "📆 <b>Monthly Premium Ledger</b>\n"
     if months:
@@ -695,12 +727,15 @@ def _load_ytd_execution_records() -> list[Any]:
             e.price,
             e.execution_time,
             e.exchange,
-            o.sec_type
+            COALESCE(o.sec_type, e.sec_type) AS sec_type,
+            e.realized_pnl,
+            e.right
         FROM executions e
         LEFT JOIN orders o ON o.order_id = e.order_id
         WHERE e.execution_time >= :revenue_start
           AND (
             o.sec_type = 'OPT'
+            OR o.sec_type = 'BAG'
             OR (o.sec_type IS NULL AND e.exec_id LIKE 'import-%')
           )
         ORDER BY e.execution_time ASC
@@ -793,6 +828,149 @@ def _format_revenue_db_fallback(error: Exception, historical_records: list[Any])
         synced_count=None,
     )
     return msg
+
+
+def _format_nav_reconciliation_message(
+    net_liq: float,
+    cash: float,
+    portfolio: list[Any],
+    initial_fund: Optional[float],
+) -> str:
+    from ib_async import Option, Stock
+
+    stock_value = 0.0
+    option_value = 0.0
+    stock_pnl: dict[str, float] = {}
+    short_opt_pnl: dict[str, float] = {}
+    long_opt_pnl: dict[str, float] = {}
+    short_opt_lines: list[str] = []
+    long_opt_lines: list[str] = []
+
+    for item in portfolio:
+        if item.position == 0:
+            continue
+        contract = item.contract
+        qty = float(item.position)
+        mkt_value = float(item.marketValue or 0)
+        unrealized = float(item.unrealizedPNL or 0)
+        symbol = contract.symbol
+
+        if isinstance(contract, Stock):
+            stock_value += mkt_value
+            stock_pnl[symbol] = stock_pnl.get(symbol, 0.0) + unrealized
+        elif isinstance(contract, Option):
+            option_value += mkt_value
+            right = "C" if contract.right == "C" else "P"
+            expiry = str(contract.lastTradeDateOrContractMonth or "")
+            if len(expiry) == 8:
+                expiry = f"{expiry[2:4]}{expiry[4:6]}{expiry[6:]}"
+            strike = f"{contract.strike:g}"
+            desc = f"{symbol} {expiry} {strike}{right} ×{abs(qty):.0f}"
+            if qty < 0:
+                short_opt_pnl[symbol] = short_opt_pnl.get(symbol, 0.0) + unrealized
+                sign = "+" if unrealized >= 0 else ""
+                short_opt_lines.append(f"  • SHORT {desc}: <b>{sign}{_money(unrealized)}</b>")
+            else:
+                long_opt_pnl[symbol] = long_opt_pnl.get(symbol, 0.0) + unrealized
+                sign = "+" if unrealized >= 0 else ""
+                long_opt_lines.append(f"  • LONG  {desc}: <b>{sign}{_money(unrealized)}</b>")
+
+    total_stock_pnl = sum(stock_pnl.values())
+    total_short_pnl = sum(short_opt_pnl.values())
+    total_long_pnl = sum(long_opt_pnl.values())
+    total_opt_pnl = total_short_pnl + total_long_pnl
+
+    msg = "💼 <b>NAV Reconciliation</b>\n\n"
+
+    if initial_fund:
+        gain = net_liq - initial_fund
+        gain_pct = gain / initial_fund * 100
+        sign = "+" if gain >= 0 else ""
+        msg += "📌 <b>vs Initial Fund</b>\n"
+        msg += f"• Initial:  <b>{_money(initial_fund)}</b>\n"
+        msg += f"• NAV now:  <b>{_money(net_liq)}</b>\n"
+        msg += f"• Net gain: <b>{sign}{_money(gain)} ({sign}{gain_pct:.1f}%)</b>\n\n"
+
+    msg += "💰 <b>Components</b>\n"
+    msg += f"• Cash:        <b>{_money(cash)}</b>\n"
+    msg += f"• Stocks:      <b>{_money(stock_value)}</b>\n"
+    msg += f"• Options MV:  <b>{_money(option_value)}</b>\n"
+    msg += f"• <i>NAV total:</i>  <b>{_money(net_liq)}</b>\n\n"
+
+    msg += "📊 <b>Stock Unrealized P&amp;L</b>\n"
+    for sym, pnl in sorted(stock_pnl.items()):
+        sign = "+" if pnl >= 0 else ""
+        msg += f"• {html.escape(sym)}: <b>{sign}{_money(pnl)}</b>\n"
+    total_stock_sign = "+" if total_stock_pnl >= 0 else ""
+    msg += f"• <b>Net: {total_stock_sign}{_money(total_stock_pnl)}</b>\n\n"
+
+    msg += "📈 <b>Option Unrealized P&amp;L</b>\n"
+    if short_opt_lines:
+        msg += "  <i>Short (theta income)</i>\n"
+        msg += "\n".join(short_opt_lines) + "\n"
+        s_sign = "+" if total_short_pnl >= 0 else ""
+        msg += f"  ↳ Short net: <b>{s_sign}{_money(total_short_pnl)}</b>\n"
+    if long_opt_lines:
+        msg += "  <i>Long LEAPS</i>\n"
+        msg += "\n".join(long_opt_lines) + "\n"
+        l_sign = "+" if total_long_pnl >= 0 else ""
+        msg += f"  ↳ LEAPS net: <b>{l_sign}{_money(total_long_pnl)}</b>\n"
+    opt_sign = "+" if total_opt_pnl >= 0 else ""
+    msg += f"• <b>All OPT net: {opt_sign}{_money(total_opt_pnl)}</b>\n\n"
+
+    if initial_fund:
+        realized_implied = net_liq - initial_fund - total_stock_pnl - total_opt_pnl
+        r_sign = "+" if realized_implied >= 0 else ""
+        msg += "💡 <b>Implied Realized (in cash)</b>\n"
+        msg += "• = NAV − initial − stock Δ − OPT Δ\n"
+        msg += f"• <b>{r_sign}{_money(realized_implied)}</b>\n"
+        msg += "<i>(option premium collected + interest + any prior gains)</i>"
+
+    return msg
+
+
+async def nav_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not is_authorized(update.effective_chat.id):
+        return
+    if not config:
+        await update.message.reply_text("Error: Config not loaded.")
+        return
+
+    initial_fund: Optional[float] = None
+    if context.args:
+        try:
+            initial_fund = float(context.args[0].replace(",", ""))
+        except ValueError:
+            await update.message.reply_text("Usage: /nav [initial_fund]  e.g. /nav 95000")
+            return
+    if initial_fund is None:
+        initial_fund = config.telegram.initial_fund
+
+    status_msg = await update.message.reply_text("Fetching NAV data from IBKR...")
+    ib = None
+    try:
+        ib = await get_ib_connection()
+        account_summary = await ib.accountSummaryAsync(config.runtime.account.number)
+        portfolio = ib.portfolio(config.runtime.account.number)
+        ib.disconnect()
+        ib = None
+
+        from thetagang.util import account_summary_to_dict
+        acct_dict = account_summary_to_dict(account_summary)
+        net_liq = float(acct_dict.get("NetLiquidation", {}).value or 0)
+        cash = float(acct_dict.get("TotalCashValue", {}).value or 0)
+
+        message = _format_nav_reconciliation_message(
+            net_liq=net_liq,
+            cash=cash,
+            portfolio=list(portfolio),
+            initial_fund=initial_fund,
+        )
+        await status_msg.edit_text(message, parse_mode="HTML")
+    except Exception as e:
+        if ib and ib.isConnected():
+            ib.disconnect()
+        await status_msg.edit_text(_ibkr_err(e), parse_mode="HTML")
 
 
 def _record_ibkr_execution_fills(fills: list[Any]) -> None:
@@ -1009,6 +1187,147 @@ def is_authorized(chat_id: int) -> bool:
     return str(chat_id) == str(config.telegram.chat_id)
 
 
+def _configured_trading_mode() -> str:
+    if not config:
+        return "unknown"
+    ibc = getattr(config, "ibc", None)
+    if ibc is None:
+        runtime = getattr(config, "runtime", None)
+        ibc = getattr(runtime, "ibc", None)
+    return str(getattr(ibc, "tradingMode", "unknown")).lower()
+
+
+def _is_live_trading() -> bool:
+    return _configured_trading_mode() == "live"
+
+
+def _live_arm_phrase(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(TAIPEI_TZ)
+    return f"LIVE-{now.astimezone(TAIPEI_TZ):%Y%m%d}"
+
+
+def _is_live_armed(now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    return _live_armed_until is not None and now < _live_armed_until
+
+
+def _confirmation_args(args: Sequence[str]) -> tuple[list[str], Optional[str]]:
+    cleaned: list[str] = []
+    confirm_code: Optional[str] = None
+    skip_next = False
+    for idx, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--confirm" and idx + 1 < len(args):
+            confirm_code = args[idx + 1]
+            skip_next = True
+            continue
+        if arg.startswith("--confirm="):
+            confirm_code = arg.split("=", 1)[1]
+            continue
+        cleaned.append(arg)
+    return cleaned, confirm_code
+
+
+def _pending_fingerprint(command_name: str, args: Sequence[str], chat_id: int) -> str:
+    return json.dumps(
+        {"chat_id": str(chat_id), "command": command_name, "args": list(args)},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _purge_expired_confirmations(now: Optional[datetime] = None) -> None:
+    now = now or datetime.now(timezone.utc)
+    expired = [
+        nonce
+        for nonce, item in _pending_live_confirmations.items()
+        if item["expires_at"] <= now
+    ]
+    for nonce in expired:
+        _pending_live_confirmations.pop(nonce, None)
+
+
+async def arm_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _live_armed_until
+    if not update.effective_chat or not is_authorized(update.effective_chat.id):
+        return
+    if not _is_live_trading():
+        await update.message.reply_text(
+            f"目前 TradingMode={_configured_trading_mode()}，不需要 arm live。"
+        )
+        return
+    expected = _live_arm_phrase()
+    provided = context.args[0] if context.args else ""
+    if provided != expected:
+        await update.message.reply_text(
+            "⚠️ LIVE trading 尚未解鎖。\n"
+            f"若確定今天要允許 Telegram 交易指令，請輸入：\n"
+            f"<code>/arm_live {expected}</code>",
+            parse_mode="HTML",
+        )
+        return
+    _live_armed_until = datetime.now(timezone.utc) + timedelta(hours=LIVE_ARM_TTL_HOURS)
+    await update.message.reply_text(
+        "🔓 <b>LIVE trading Telegram commands armed</b>\n"
+        f"有效期限：{_live_armed_until.astimezone(TAIPEI_TZ):%Y-%m-%d %H:%M:%S} 台北時間\n"
+        "重啟 daemon 或到期後會自動失效。",
+        parse_mode="HTML",
+    )
+
+
+def live_guarded_command(command_name: str):
+    def decorator(handler):
+        async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not update.effective_chat or not is_authorized(update.effective_chat.id):
+                return await handler(update, context)
+            if not _is_live_trading():
+                return await handler(update, context)
+            if not _is_live_armed():
+                await update.message.reply_text(
+                    "⛔ LIVE trading 指令被擋下：尚未 arm live。\n"
+                    f"今天的解鎖指令：<code>/arm_live {_live_arm_phrase()}</code>",
+                    parse_mode="HTML",
+                )
+                return
+
+            _purge_expired_confirmations()
+            original_args = list(getattr(context, "args", []) or [])
+            cleaned_args, confirm_code = _confirmation_args(original_args)
+            fingerprint = _pending_fingerprint(command_name, cleaned_args, update.effective_chat.id)
+            pending = _pending_live_confirmations.get(confirm_code or "")
+            if pending and pending["fingerprint"] == fingerprint:
+                _pending_live_confirmations.pop(confirm_code or "", None)
+                context.args = cleaned_args
+                logger.warning(
+                    "LIVE Telegram command confirmed: /%s args=%s chat_id=%s",
+                    command_name,
+                    cleaned_args,
+                    update.effective_chat.id,
+                )
+                return await handler(update, context)
+
+            nonce = secrets.token_hex(3).upper()
+            _pending_live_confirmations[nonce] = {
+                "fingerprint": fingerprint,
+                "expires_at": datetime.now(timezone.utc)
+                + timedelta(seconds=LIVE_CONFIRMATION_TIMEOUT_SECONDS),
+            }
+            await update.message.reply_text(
+                "⚠️ <b>LIVE trading 二段確認</b>\n"
+                f"指令：<code>/{html.escape(command_name)} {' '.join(html.escape(a) for a in cleaned_args)}</code>\n"
+                f"確認碼：<code>{nonce}</code>\n\n"
+                "若確定執行，請在 5 分鐘內重送原指令並加上：\n"
+                f"<code>--confirm {nonce}</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        return _wrapped
+    return decorator
+
+
 class IBKROfflineError(RuntimeError):
     pass
 
@@ -1086,6 +1405,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         "💰 <b>績效分析</b>\n"
         "/revenue — 選擇權 premium 收入（月報 + 未來 3 個月預估）\n"
+        "/nav [initial] — NAV 完整拆解：股票/選擇權/現金 vs 初始資金\n"
         "/pnl — Realized premium：今日 / 本週 / 本月 / YTD\n"
         "/theta — 各部位每日 theta decay 金額 ✱\n"
         "/expirations — 即將到期合約（DTE 警示）\n\n"
@@ -1098,7 +1418,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/greeks — Portfolio 全希臘值（Δ/Γ/Θ/V）+ 各標的分解 ✱\n"
         "/iv &lt;symbol&gt; — 個股 IV + 52 週 IV Rank / Percentile ✱\n"
         "/attribution — P&amp;L 歸因（Put/Call premium / Roll / 股票）\n"
-        "/whatif &lt;symbol&gt; — 模擬平倉對保證金的影響（不下單） ✱\n"
         "/leaps &lt;symbol&gt; — PMCC LEAPS Call 建議（delta 0.70–0.80） ✱\n"
         "/buy_leaps &lt;symbol&gt; &lt;YYYYMMDD&gt; &lt;strike&gt; — 掛 LEAPS Call 限價買單 ✱\n\n"
 
@@ -1328,22 +1647,74 @@ async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 .order_by(ExecutionRecord.execution_time.desc())
             )
             executions = session.execute(stmt).scalars().all()
-            
+
         if not executions:
             await status_msg.edit_text("No trade executions found in the last 3 days.")
             return
-            
-        msg = "🔄 <b>Recent Trades (Last 3 Days)</b>\n\n"
+
+        def _fmt_time(ex: ExecutionRecord) -> str:
+            if not ex.execution_time:
+                return "-"
+            dt_utc = ex.execution_time.replace(tzinfo=timezone.utc) if ex.execution_time.tzinfo is None else ex.execution_time
+            return dt_utc.astimezone(TAIPEI_TZ).strftime("%m-%d %H:%M") + " TW"
+
+        # Group by order_id; ungrouped legs get their own singleton bucket
+        from collections import defaultdict
+        groups: dict[str, list[ExecutionRecord]] = defaultdict(list)
         for ex in executions:
-            if ex.execution_time:
-                dt_utc = ex.execution_time.replace(tzinfo=timezone.utc) if ex.execution_time.tzinfo is None else ex.execution_time
-                dt_tw = dt_utc.astimezone(TAIPEI_TZ)
-                time_str = dt_tw.strftime("%m-%d %H:%M") + " TW"
+            key = str(ex.order_id) if ex.order_id else f"solo_{ex.id}"
+            groups[key].append(ex)
+
+        # Sort groups by most-recent execution time (desc)
+        def _group_time(legs: list[ExecutionRecord]) -> datetime:
+            times = [l.execution_time for l in legs if l.execution_time]
+            return max(times) if times else datetime.min
+
+        sorted_groups = sorted(groups.values(), key=_group_time, reverse=True)
+
+        msg = "🔄 <b>Recent Trades (Last 3 Days)</b>\n\n"
+        for legs in sorted_groups:
+            # Filter out IBKR combo net-price synthetic leg (price < 0)
+            real_legs = [l for l in legs if l.price is not None and l.price >= 0]
+            if not real_legs:
+                continue
+
+            time_str = _fmt_time(real_legs[0])
+            symbol = real_legs[0].symbol or "?"
+            sec_type = (real_legs[0].sec_type or "OPT").upper()
+
+            buy_legs = [l for l in real_legs if l.side == "BOT"]
+            sell_legs = [l for l in real_legs if l.side == "SLD"]
+
+            if buy_legs and sell_legs:
+                # Roll: closed old position (BOT) + opened new (SLD)
+                close_leg = buy_legs[0]
+                open_leg = sell_legs[0]
+                net_credit = open_leg.price - close_leg.price
+                net_sign = "+" if net_credit >= 0 else ""
+                net_dollar = net_credit * abs(close_leg.shares or 1) * 100
+                msg += (
+                    f"🔄 <b>ROLL {symbol}</b> <i>{sec_type}</i>  <code>{time_str}</code>\n"
+                    f"  BOT @ <b>${close_leg.price:.2f}</b> → SLD @ <b>${open_leg.price:.2f}</b>  |  Roll 收益: <b>{net_sign}${net_dollar:.0f}</b>\n\n"
+                )
+            elif sell_legs:
+                # Open new position
+                leg = sell_legs[0]
+                qty = abs(leg.shares or 1)
+                premium = (leg.price or 0) * qty * 100
+                msg += (
+                    f"🟢 <b>開倉 {symbol}</b> <i>{sec_type}</i>  <code>{time_str}</code>\n"
+                    f"  SLD {qty:.0f}x @ <b>${leg.price:.2f}</b>  收權利金: <b>+${premium:.0f}</b>\n\n"
+                )
             else:
-                time_str = "-"
-            side_str = "🟢 BOT" if ex.side == "BOT" else "🔴 SLD"
-            msg += f"• <code>{time_str}</code> | {side_str} <b>{abs(ex.shares):.1f} {ex.symbol}</b> @ ${ex.price:.2f} (Ref: {ex.order_ref or '-'})\n"
-            
+                # Close / buy-to-close
+                leg = buy_legs[0] if buy_legs else real_legs[0]
+                qty = abs(leg.shares or 1)
+                msg += (
+                    f"🔴 <b>平倉 {symbol}</b> <i>{sec_type}</i>  <code>{time_str}</code>\n"
+                    f"  BOT {qty:.0f}x @ <b>${leg.price:.2f}</b>\n\n"
+                )
+
         await status_msg.edit_text(msg, parse_mode="HTML")
     except Exception as e:
         await status_msg.edit_text(f"Error querying trades: {e}")
@@ -1740,6 +2111,7 @@ async def preview_config_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"Error previewing config: {e}")
 
 
+@live_guarded_command('apply_config')
 async def apply_config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global config
     if not update.effective_chat or not is_authorized(update.effective_chat.id):
@@ -2009,57 +2381,15 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     status_msg = await update.message.reply_text("Calculating P&L from database...")
     try:
-        from sqlalchemy import create_engine, text as sa_text
-
-        db_url = config.runtime.database.resolve_url(config_path)
-        engine = create_engine(db_url, future=True)
-
         now_taipei = datetime.now(TAIPEI_TZ)
         today_start = now_taipei.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timedelta(days=today_start.weekday())
         month_start = today_start.replace(day=1)
-        ytd_start = _revenue_start_datetime().replace(tzinfo=TAIPEI_TZ) if _revenue_start_datetime().tzinfo else _revenue_start_datetime().replace(tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
 
-        # Convert to UTC for DB comparison (stored as UTC-naive)
-        def _to_utc_naive(dt_taipei: datetime) -> datetime:
-            return dt_taipei.astimezone(timezone.utc).replace(tzinfo=None)
-
-        query = sa_text(
-            """
-            SELECT
-                e.side,
-                e.shares,
-                e.price,
-                e.execution_time,
-                o.sec_type
-            FROM executions e
-            LEFT JOIN orders o ON o.order_id = e.order_id
-            WHERE e.execution_time >= :ytd_start
-              AND (
-                o.sec_type = 'OPT'
-                OR o.sec_type = 'BAG'
-                OR (o.sec_type IS NULL AND e.exec_id LIKE 'import-%')
-              )
-            ORDER BY e.execution_time ASC
-            """
-        )
-
-        with engine.connect() as conn:
-            rows = list(conn.execute(query, {"ytd_start": _to_utc_naive(ytd_start)}).mappings())
-
-        def _cashflow(row: Any) -> float:
-            side = str(row.get("side") or "")
-            shares = float(row.get("shares") or 0)
-            price = float(row.get("price") or 0)
-            sec_type = row.get("sec_type")
-            # Imported rows (sec_type IS NULL) with high BOT price = stock/LEAPS capital positions
-            if side == "BOT" and sec_type is None and price >= 50.0:
-                return 0.0
-            sign = 1.0 if side == "SLD" else -1.0
-            return sign * shares * abs(price) * 100
+        rows = _load_ytd_execution_records()
 
         def _row_dt(row: Any) -> datetime:
-            raw = row.get("execution_time")
+            raw = getattr(row, "execution_time", None)
             if isinstance(raw, datetime):
                 dt = raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
             else:
@@ -2069,10 +2399,18 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     dt = datetime.now(timezone.utc)
             return dt.astimezone(TAIPEI_TZ)
 
-        today_pnl = sum(_cashflow(r) for r in rows if _row_dt(r) >= today_start)
-        week_pnl = sum(_cashflow(r) for r in rows if _row_dt(r) >= week_start)
-        month_pnl = sum(_cashflow(r) for r in rows if _row_dt(r) >= month_start)
-        ytd_pnl = sum(_cashflow(r) for r in rows)
+        def _row_cashflow(row: Any) -> float:
+            # IBKR cost-basis method: use stored realized_pnl when available
+            realized = getattr(row, "realized_pnl", None)
+            if realized is not None:
+                return float(realized)
+            result = _execution_record_cashflow(row)
+            return result[2] if result else 0.0
+
+        today_pnl = sum(_row_cashflow(r) for r in rows if _row_dt(r) >= today_start)
+        week_pnl = sum(_row_cashflow(r) for r in rows if _row_dt(r) >= week_start)
+        month_pnl = sum(_row_cashflow(r) for r in rows if _row_dt(r) >= month_start)
+        ytd_pnl = sum(_row_cashflow(r) for r in rows)
 
         # Try to get live unrealized PnL
         unrealized_total: Optional[float] = None
@@ -2090,12 +2428,14 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         def _sign_emoji(v: float) -> str:
             return "🟢" if v >= 0 else "🔴"
 
-        msg = "💰 <b>Realized Option Premium P&L</b>\n\n"
+        msg = "💰 <b>Realized Option P&L (IBKR cost-basis)</b>\n"
+        msg += "<i>closed / expired positions only</i>\n\n"
         msg += f"{_sign_emoji(today_pnl)} Today:       <b>{_money(today_pnl)}</b>\n"
         msg += f"{_sign_emoji(week_pnl)} This Week:   <b>{_money(week_pnl)}</b>\n"
         msg += f"{_sign_emoji(month_pnl)} This Month:  <b>{_money(month_pnl)}</b>\n"
         msg += f"{_sign_emoji(ytd_pnl)} YTD / Since {_revenue_start_datetime().strftime('%Y-%m-%d')}: <b>{_money(ytd_pnl)}</b>\n"
-        msg += f"\n📊 Total executions counted: <b>{len(rows)}</b>\n"
+        realized_rows = sum(1 for r in rows if getattr(r, "realized_pnl", None) not in (None, 0.0))
+        msg += f"\n📊 Close/expiry events: <b>{realized_rows}</b>  (total DB records: {len(rows)})\n"
 
         if unrealized_total is not None:
             emoji = _sign_emoji(unrealized_total)
@@ -2657,109 +2997,6 @@ async def iv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await status_msg.edit_text(f"Error fetching IV for {symbol}: {html.escape(str(e))}")
 
 
-async def whatif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/whatif <symbol> — Simulate closing all positions for a symbol, show margin impact."""
-    if not update.effective_chat or not is_authorized(update.effective_chat.id):
-        return
-    if not config:
-        await update.message.reply_text("Error: Config not loaded.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /whatif <symbol>  e.g. /whatif TSLA")
-        return
-
-    symbol = context.args[0].upper()
-    status_msg = await update.message.reply_text(f"Simulating close of {symbol} positions...")
-    ib = None
-    try:
-        from ib_async import MarketOrder, util
-
-        ib = await get_ib_connection()
-        portfolio = ib.portfolio(config.runtime.account.number)
-
-        targets = [
-            i for i in portfolio
-            if i.contract.symbol.upper() == symbol and i.position != 0
-        ]
-        if not targets:
-            await status_msg.edit_text(f"No open positions found for {symbol}.")
-            ib.disconnect()
-            return
-
-        results = []
-        total_maint_change = 0.0
-        total_init_change  = 0.0
-        total_equity_change = 0.0
-        total_commission   = 0.0
-
-        for item in targets:
-            qty    = item.position
-            action = "BUY" if qty < 0 else "SELL"
-            order  = MarketOrder(action, abs(qty))
-            order.whatIf = True
-            state  = await ib.whatIfOrderAsync(item.contract, order)
-
-            def _parse(s: str) -> float:
-                try:
-                    return float(s)
-                except (TypeError, ValueError):
-                    return 0.0
-
-            maint_chg  = _parse(state.maintMarginChange)
-            init_chg   = _parse(state.initMarginChange)
-            equity_chg = _parse(state.equityWithLoanChange)
-            commission = state.commission if state.commission and not util.isNan(state.commission) else 0.0
-
-            total_maint_change  += maint_chg
-            total_init_change   += init_chg
-            total_equity_change += equity_chg
-            total_commission    += commission
-
-            contract = item.contract
-            sec = contract.secType
-            label = contract.localSymbol or contract.symbol
-            results.append({
-                "label":      label,
-                "sec":        sec,
-                "action":     action,
-                "qty":        abs(qty),
-                "maint_chg":  maint_chg,
-                "commission": commission,
-                "mkt_value":  item.marketValue,
-            })
-
-        ib.disconnect()
-
-        freed = total_maint_change < 0
-        emoji = "🟢" if freed else "🔴"
-
-        msg = f"🔮 <b>What-If: Close All {html.escape(symbol)}</b>\n\n"
-        for r in results:
-            chg_str = _money(abs(r["maint_chg"]))
-            direction = "frees" if r["maint_chg"] < 0 else "uses"
-            msg += (
-                f"• {r['action']} {r['qty']:g} <b>{html.escape(r['label'])}</b> [{r['sec']}]\n"
-                f"  Margin {direction} <b>{chg_str}</b> | commission ~{_money(r['commission'])}\n"
-            )
-
-        msg += (
-            f"\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"{emoji} <b>Net Impact</b>\n"
-            f"• Maint. Margin:  <b>{_money(total_maint_change)}</b> "
-            f"({'freed' if freed else 'added'})\n"
-            f"• Init. Margin:   <b>{_money(total_init_change)}</b>\n"
-            f"• Equity change:  <b>{_money(total_equity_change)}</b>\n"
-            f"• Est. commission: <b>~{_money(total_commission)}</b>\n"
-        )
-        msg += "\n<i>⚠️ What-if simulation only — no order placed.</i>"
-
-        await status_msg.edit_text(msg, parse_mode="HTML")
-    except Exception as e:
-        if ib and ib.isConnected():
-            ib.disconnect()
-        await status_msg.edit_text(f"Error in what-if simulation: {html.escape(str(e))}")
-
-
 async def attribution_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """P&L attribution: put premium / call premium / rolls / stock / SGOV."""
     if not update.effective_chat or not is_authorized(update.effective_chat.id):
@@ -2770,83 +3007,46 @@ async def attribution_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     status_msg = await update.message.reply_text("Building P&L attribution...")
     try:
-        import json as _json
-        from sqlalchemy import create_engine, text as sa_text
+        # Use _load_ytd_execution_records() — it handles import-* records correctly
+        # via LEFT JOIN + exec_id prefix fallback, unlike the old INNER JOIN on orders.
+        rows = _load_ytd_execution_records()
 
-        db_url = config.runtime.database.resolve_url(config_path)
-        engine = create_engine(db_url, future=True)
-        ytd_start = _revenue_start_datetime()
-
-        query = sa_text(
-            """
-            SELECT
-                e.side, e.shares, e.price, e.symbol, e.execution_time,
-                o.sec_type, o.action, o.intent_id,
-                oi.payload_json
-            FROM executions e
-            JOIN orders o ON o.order_id = e.order_id
-            LEFT JOIN order_intents oi ON oi.id = o.intent_id
-            WHERE e.execution_time >= :ytd_start
-            ORDER BY e.execution_time ASC
-            """
-        )
-
-        with engine.connect() as conn:
-            rows = list(conn.execute(query, {"ytd_start": ytd_start}).mappings())
-
-        # Buckets: put_premium, call_premium, rolls, stock, sgov, other
         buckets: dict[str, float] = {
-            "put":   0.0,
-            "call":  0.0,
-            "roll":  0.0,
-            "stock": 0.0,
-            "sgov":  0.0,
-            "other": 0.0,
+            "put": 0.0, "call": 0.0, "roll": 0.0,
+            "stock": 0.0, "sgov": 0.0, "other": 0.0,
         }
         by_symbol: dict[str, float] = {}
 
         for row in rows:
-            side     = str(row.get("side") or "")
-            shares   = float(row.get("shares") or 0)
-            price    = float(row.get("price") or 0)
-            symbol   = str(row.get("symbol") or "?")
-            sec_type = str(row.get("sec_type") or "")
-            sign     = 1.0 if side == "SLD" else -1.0
+            realized = float(getattr(row, "realized_pnl", None) or 0.0)
+            if realized == 0.0:
+                continue
 
-            if sec_type == "OPT":
-                cf = sign * shares * price * 100
-                # Extract right from order_intent payload
-                right = None
-                payload = row.get("payload_json")
-                if payload:
-                    try:
-                        p = _json.loads(str(payload))
-                        right = p.get("contract", {}).get("right", "")
-                    except Exception:
-                        pass
+            symbol   = str(getattr(row, "symbol", "") or "?")
+            sec_type = str(getattr(row, "sec_type", "") or "OPT")
+            right    = str(getattr(row, "right", "") or "")
+            exec_id  = str(getattr(row, "exec_id", "") or "")
+
+            # Treat import-* records without sec_type as OPT (all imports are options)
+            if not sec_type and exec_id.startswith("import-"):
+                sec_type = "OPT"
+
+            if sec_type in ("OPT", "BAG"):
                 if right == "P":
-                    buckets["put"] += cf
+                    buckets["put"] += realized
                 elif right == "C":
-                    buckets["call"] += cf
+                    buckets["call"] += realized
                 else:
-                    buckets["other"] += cf
-                by_symbol[symbol] = by_symbol.get(symbol, 0.0) + cf
-
-            elif sec_type == "BAG":
-                # Combo/roll orders: price is net debit/credit per unit
-                cf = sign * shares * price * 100
-                buckets["roll"] += cf
-                by_symbol[symbol] = by_symbol.get(symbol, 0.0) + cf
-
+                    buckets["other"] += realized
+                by_symbol[symbol] = by_symbol.get(symbol, 0.0) + realized
             elif sec_type == "STK":
-                cf = sign * shares * price
-                if symbol.upper() == "SGOV":
-                    buckets["sgov"] += cf
+                if symbol.upper() == (config.strategies.cash_management.cash_fund if config else "SGOV"):
+                    buckets["sgov"] += realized
                 else:
-                    buckets["stock"] += cf
-                by_symbol[symbol] = by_symbol.get(symbol, 0.0) + cf
+                    buckets["stock"] += realized
+                by_symbol[symbol] = by_symbol.get(symbol, 0.0) + realized
 
-        # Try to get live unrealized P&L by type
+        # Live unrealized P&L
         unrealized_opts: Optional[float] = None
         unrealized_stk: Optional[float] = None
         try:
@@ -2854,12 +3054,19 @@ async def attribution_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             ib = await get_ib_connection()
             portfolio = ib.portfolio(config.runtime.account.number)
             ib.disconnect()
-            unrealized_opts = sum(i.unrealizedPNL for i in portfolio if isinstance(i.contract, Option) and i.position != 0)
-            unrealized_stk  = sum(i.unrealizedPNL for i in portfolio if isinstance(i.contract, Stock)  and i.position != 0)
+            unrealized_opts = sum(
+                i.unrealizedPNL for i in portfolio
+                if isinstance(i.contract, Option) and i.position != 0
+            )
+            unrealized_stk = sum(
+                i.unrealizedPNL for i in portfolio
+                if isinstance(i.contract, Stock) and i.position != 0
+            )
         except Exception:
             pass
 
         total_realized = sum(buckets.values())
+        ytd_start = _revenue_start_datetime()
 
         def _row(label: str, v: float) -> str:
             emoji = "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
@@ -2870,31 +3077,32 @@ async def attribution_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"<i>(since {ytd_start.strftime('%Y-%m-%d')})</i>\n\n"
             "<b>Realized (Option Premium)</b>\n"
         )
-        msg += _row("Put premium",   buckets["put"])
-        msg += _row("Call premium",  buckets["call"])
-        msg += _row("Roll credits",  buckets["roll"])
+        msg += _row("Put premium",  buckets["put"])
+        msg += _row("Call premium", buckets["call"])
+        if buckets["roll"]:
+            msg += _row("Roll credits", buckets["roll"])
         if buckets["other"]:
-            msg += _row("Other OPT",  buckets["other"])
+            msg += _row("Other OPT", buckets["other"])
 
         msg += "\n<b>Realized (Equity)</b>\n"
-        msg += _row("Stock (STK)",   buckets["stock"])
-        msg += _row("SGOV / Cash",   buckets["sgov"])
+        msg += _row("Stock (STK)",  buckets["stock"])
+        msg += _row("SGOV / Cash",  buckets["sgov"])
+        msg += "<i>⚠️ Stock assignment gains (STK) not tracked in bot DB — see IBKR Activity Statement for full equity P&L.</i>\n"
 
-        msg += f"\n{'🟢' if total_realized>=0 else '🔴'} <b>Total Realized:  {_money(total_realized)}</b>\n"
+        msg += f"\n{'🟢' if total_realized >= 0 else '🔴'} <b>Total Realized:  {_money(total_realized)}</b>\n"
 
         if unrealized_opts is not None or unrealized_stk is not None:
             msg += "\n<b>Unrealized (Live)</b>\n"
             if unrealized_opts is not None:
-                msg += _row("Options",  unrealized_opts)
+                msg += _row("Options", unrealized_opts)
             if unrealized_stk is not None:
-                msg += _row("Stocks",   unrealized_stk)
+                msg += _row("Stocks",  unrealized_stk)
             total_unreal = (unrealized_opts or 0) + (unrealized_stk or 0)
             grand = total_realized + total_unreal
-            msg += f"\n{'🟢' if grand>=0 else '🔴'} <b>Grand Total:     {_money(grand)}</b>\n"
+            msg += f"\n{'🟢' if grand >= 0 else '🔴'} <b>Grand Total:     {_money(grand)}</b>\n"
         else:
             msg += "\n⚠️ Unrealized P&L unavailable (IBKR offline)\n"
 
-        # Per-symbol breakdown
         if by_symbol:
             msg += "\n<b>By Symbol (realized)</b>\n"
             for sym, v in sorted(by_symbol.items(), key=lambda x: -abs(x[1])):
@@ -3226,6 +3434,316 @@ async def modify_order_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_msg.edit_text(_ibkr_err(e), parse_mode="HTML")
 
 
+async def wheel_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/wheel_check — Scan all configured symbols for Wheel strategy gaps."""
+    if not update.effective_chat or not is_authorized(update.effective_chat.id):
+        return
+    if not config:
+        await update.message.reply_text("Error: Config not loaded.")
+        return
+
+    status_msg = await update.message.reply_text("🔍 Scanning Wheel positions...")
+    ib = None
+    try:
+        from ib_async import Option, Stock
+        from thetagang.options import option_dte
+
+        ib = await get_ib_connection()
+        portfolio = ib.portfolio(config.runtime.account.number)
+
+        # Fetch live stock prices for ITM checks
+        stock_prices: dict[str, float] = {}
+        for item in portfolio:
+            if isinstance(item.contract, Stock) and item.position != 0:
+                stock_prices[item.contract.symbol] = float(item.marketPrice or 0)
+
+        ib.disconnect()
+        ib = None
+
+        # Roll thresholds from config (defaults fallback)
+        roll_dte: int = 7
+        roll_pnl: float = 0.50
+        close_at_pnl: float = 0.90
+        try:
+            wdef = config.strategies.wheel.defaults
+            roll_dte = int(getattr(wdef.roll_when, "dte", 7))
+            roll_pnl = float(getattr(wdef.roll_when, "pnl", 0.50))
+            close_at_pnl = float(getattr(wdef.roll_when, "close_at_pnl", 0.90))
+        except Exception:
+            pass
+
+        # Classify positions per symbol
+        # sym → { stocks, short_calls, long_calls, short_puts, long_puts }
+        sym_map: dict[str, dict] = {}
+
+        def _sym(s: str) -> dict:
+            return sym_map.setdefault(s, {
+                "stocks": [],
+                "short_calls": [],
+                "long_calls": [],
+                "short_puts": [],
+                "long_puts": [],
+            })
+
+        for item in portfolio:
+            if item.position == 0:
+                continue
+            c = item.contract
+            sym = c.symbol
+            if isinstance(c, Stock):
+                _sym(sym)["stocks"].append(item)
+            elif isinstance(c, Option):
+                qty = float(item.position)
+                right = str(c.right or "").upper()
+                if right.startswith("C"):
+                    if qty < 0:
+                        _sym(sym)["short_calls"].append(item)
+                    else:
+                        _sym(sym)["long_calls"].append(item)
+                elif right.startswith("P"):
+                    if qty < 0:
+                        _sym(sym)["short_puts"].append(item)
+                    else:
+                        _sym(sym)["long_puts"].append(item)
+
+        configured_syms = set(config.portfolio.symbols.keys()) if config else set()
+        all_syms = configured_syms | set(sym_map.keys())
+
+        LEAPS_DTE_THRESHOLD = 180  # calls/puts with DTE > this are considered LEAPS
+        TREASURY_ETFS = {"SGOV", "BIL", "SHV", "SHY", "VMBS", "USFR"}
+
+        stage_lines: dict[str, str] = {}  # sym → one-line visual stage
+
+        def _dte(item: Any) -> int:
+            return option_dte(item.contract.lastTradeDateOrContractMonth) or 0
+
+        def _pnl_pct(item: Any) -> float:
+            avg = float(item.averageCost or 0)
+            pnl = float(item.unrealizedPNL or 0)
+            qty = float(abs(item.position or 1))
+            if avg <= 0 or qty == 0:
+                return 0.0
+            return pnl / (avg * qty)
+
+        def _strike(item: Any) -> float:
+            return float(getattr(item.contract, "strike", 0) or 0)
+
+        alerts: list[str] = []
+
+        for sym in sorted(all_syms):
+            g = sym_map.get(sym, {
+                "stocks": [], "short_calls": [], "long_calls": [],
+                "short_puts": [], "long_puts": [],
+            })
+            stocks      = g["stocks"]
+            s_calls     = g["short_calls"]
+            l_calls     = g["long_calls"]
+            s_puts      = g["short_puts"]
+            l_puts      = g["long_puts"]
+
+            stock_qty   = sum(int(i.position) for i in stocks)
+            stock_price = stock_prices.get(sym, 0.0)
+
+            leaps_calls = [i for i in l_calls if _dte(i) > LEAPS_DTE_THRESHOLD]
+            near_l_call = [i for i in l_calls if _dte(i) <= LEAPS_DTE_THRESHOLD]
+            leaps_puts  = [i for i in l_puts  if _dte(i) > LEAPS_DTE_THRESHOLD]
+
+            sym_label = f"<b>{html.escape(sym)}</b>"
+
+            # ── Stage detection ──────────────────────────────────────────
+            # Stage 0: Nothing
+            if not stocks and not s_calls and not l_calls and not s_puts and not l_puts:
+                if sym in configured_syms:
+                    alerts.append(
+                        f"💡 {sym_label} 無持倉 — 可開 <b>CSP</b>（賣 Cash-Secured Put）"
+                    )
+                continue
+
+            sym_issues: list[str] = []
+
+            # ── Stage visual (built up incrementally) ────────────────────
+            def _stage(csp: str, hold: str, cc: str, note: str) -> str:
+                return f"<code>[{csp:^5}]→[{hold:^5}]→[{cc:^5}]</code> {note}"
+
+            # ── Stock layer checks ────────────────────────────────────────
+            if sym in TREASURY_ETFS and stock_qty > 0:
+                stage_lines[sym] = _stage("—", f"{stock_qty}股", "💤", "Treasury 閒置")
+            elif stock_qty >= 100:
+                contracts_needed = stock_qty // 100
+                if not s_calls:
+                    sym_issues.append(
+                        f"⚠️ 持股 {stock_qty} 股，但<b>沒有賣 CC</b>（可賣 {contracts_needed} 口 Covered Call）"
+                    )
+                    stage_lines[sym] = _stage("✓", f"{stock_qty}股", "❌無", "待賣CC ⚠️")
+                else:
+                    short_call_qty = sum(abs(int(i.position)) for i in s_calls)
+                    if short_call_qty < contracts_needed:
+                        sym_issues.append(
+                            f"⚠️ 持股 {stock_qty} 股但只賣了 {short_call_qty} 口 CC"
+                            f"（應賣 {contracts_needed} 口）"
+                        )
+                        stage_lines[sym] = _stage("✓", f"{stock_qty}股", f"⚠️×{short_call_qty}", "CC 不足")
+                    else:
+                        stage_lines[sym] = _stage("✓", f"{stock_qty}股", f"🎯×{short_call_qty}", "CC中 ✅")
+
+            # ── Short Call checks ─────────────────────────────────────────
+            for item in s_calls:
+                dte  = _dte(item)
+                pnl  = _pnl_pct(item)
+                stk  = _strike(item)
+                qty  = abs(int(item.position))
+                expiry = str(item.contract.lastTradeDateOrContractMonth or "")
+                if len(expiry) == 8:
+                    expiry = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+
+                # ITM check
+                if stock_price > 0 and stk > 0 and stock_price > stk:
+                    sym_issues.append(
+                        f"🔴 Short Call ${stk:g} ({expiry}) <b>ITM</b>"
+                        f" (股價 ${stock_price:.2f} > 行使價，會被 call away！)"
+                    )
+
+                # DTE approaching roll
+                if 0 < dte <= roll_dte + 3:
+                    label = "🚨 觸發 roll" if dte <= roll_dte else "⏰ 接近 roll"
+                    sym_issues.append(
+                        f"{label}：Short Call ${stk:g} ({expiry}) DTE={dte}"
+                        f"（閾值 ≤{roll_dte}）"
+                    )
+
+                # PnL approaching 50% or close_at_pnl
+                if pnl <= -close_at_pnl:
+                    sym_issues.append(
+                        f"💰 Short Call ${stk:g} ({expiry}) PnL={pnl*100:.0f}%"
+                        f"，已達 close_at_pnl {close_at_pnl*100:.0f}%"
+                    )
+                elif pnl <= -roll_pnl:
+                    sym_issues.append(
+                        f"💰 Short Call ${stk:g} ({expiry}) PnL={pnl*100:.0f}%"
+                        f"，已達 50% roll 觸發"
+                    )
+
+            # ── Short Put checks ──────────────────────────────────────────
+            for item in s_puts:
+                dte  = _dte(item)
+                pnl  = _pnl_pct(item)
+                stk  = _strike(item)
+                expiry = str(item.contract.lastTradeDateOrContractMonth or "")
+                if len(expiry) == 8:
+                    expiry = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+
+                # ITM check for puts (stock price < strike)
+                if stock_price > 0 and stk > 0 and stock_price < stk:
+                    depth = stk - stock_price
+                    sym_issues.append(
+                        f"🔴 Short Put ${stk:g} ({expiry}) <b>ITM</b>"
+                        f" (股價 ${stock_price:.2f}，深入 ${depth:.2f})"
+                    )
+
+                # DTE
+                if 0 < dte <= roll_dte + 3:
+                    label = "🚨 觸發 roll" if dte <= roll_dte else "⏰ 接近 roll"
+                    sym_issues.append(
+                        f"{label}：Short Put ${stk:g} ({expiry}) DTE={dte}"
+                    )
+
+                # PnL
+                if pnl <= -close_at_pnl:
+                    sym_issues.append(
+                        f"💰 Short Put ${stk:g} ({expiry}) PnL={pnl*100:.0f}%"
+                        f"，達 close_at_pnl"
+                    )
+                elif pnl <= -roll_pnl:
+                    sym_issues.append(
+                        f"💰 Short Put ${stk:g} ({expiry}) PnL={pnl*100:.0f}%"
+                        f"，達 50% roll 觸發"
+                    )
+
+
+            # ── PMCC checks ───────────────────────────────────────────────
+            if leaps_calls:
+                leaps_call_qty = sum(int(i.position) for i in leaps_calls)
+                near_short_qty = sum(abs(int(i.position)) for i in s_calls)
+
+                if near_short_qty == 0:
+                    sym_issues.append(
+                        f"⚠️ 有 LEAPS Call × {leaps_call_qty}（PMCC 底倉）"
+                        f"，但<b>沒有賣近月 Short Call</b> — PMCC 不完整！"
+                    )
+                    if sym not in stage_lines:
+                        stage_lines[sym] = _stage("✓", f"LEAPS×{leaps_call_qty}", "❌無", "待配Short Call ⚠️")
+                else:
+                    # Combined coverage: stock + LEAPS + near-term long calls (call spreads)
+                    stock_slots = stock_qty // 100 if stock_qty >= 100 else 0
+                    spread_slots = sum(int(i.position) for i in near_l_call)
+                    total_coverage = stock_slots + leaps_call_qty + spread_slots
+                    naked_qty = max(0, near_short_qty - total_coverage)
+
+                    if naked_qty > 0:
+                        sym_issues.append(
+                            f"⚠️ CC 超出覆蓋！{stock_qty}股({stock_slots}口)+LEAPS({leaps_call_qty}口)"
+                            f"=共{total_coverage}口，但賣了 {near_short_qty} 口"
+                            f" → <b>{naked_qty} 口裸空 Call</b>"
+                        )
+                    elif near_short_qty < leaps_call_qty:
+                        sym_issues.append(
+                            f"⚠️ PMCC：LEAPS {leaps_call_qty} 口，"
+                            f"但 Short Call 只有 {near_short_qty} 口（未完全覆蓋）"
+                        )
+                    else:
+                        pass  # healthy PMCC — no alert needed
+                    if sym not in stage_lines:
+                        stage_lines[sym] = _stage("✓", f"LEAPS×{leaps_call_qty}", f"🎯×{near_short_qty}", "PMCC中 ✅" if naked_qty == 0 else f"⚠️{naked_qty}口裸空")
+
+                # LEAPS PnL deep loss warning
+                for item in leaps_calls:
+                    pnl = _pnl_pct(item)
+                    stk = _strike(item)
+                    if pnl < -0.30:
+                        sym_issues.append(
+                            f"⚠️ LEAPS Call ${stk:g} PnL={pnl*100:.0f}%（帳面虧損較大）"
+                        )
+
+            elif s_calls and stock_qty < 100:
+                # Has short calls but no stock and no LEAPS — naked call!
+                sym_issues.append(
+                    f"🚨 Short Call 但無持股也無 LEAPS — <b>裸空 Call，風險極高！</b>"
+                )
+
+            # ── No short options at all ───────────────────────────────────
+            if not s_calls and not s_puts and stock_qty >= 100 and sym not in TREASURY_ETFS:
+                # Has stock but no short options and not already flagged
+                pass
+
+            if sym_issues:
+                alerts.append(f"\n🔶 {sym_label}\n" + "\n".join(f"  {x}" for x in sym_issues))
+
+        # ── Format output ─────────────────────────────────────────────────
+        msg = "🔍 <b>Wheel Strategy Gap Check</b>\n"
+        msg += f"<i>Roll 條件：DTE≤{roll_dte} 或 PnL≥{roll_pnl*100:.0f}%</i>\n"
+
+        # ── Wheel Stage Visual ─────────────────────────────────────────────
+        if stage_lines:
+            msg += "\n📊 <b>Wheel 階段圖</b>  <code> [CSP] → [持股] → [CC] </code>\n"
+            for sym in sorted(stage_lines):
+                msg += f"  <b>{html.escape(sym)}</b>  {stage_lines[sym]}\n"
+
+        if alerts:
+            msg += "\n⚠️ <b>需要關注</b>\n"
+            msg += "\n".join(alerts)
+        else:
+            msg += "\n✅ 無異動，持倉正常\n"
+
+        msg += "\n\n<i>/positions 完整部位 · /leaps &lt;symbol&gt; PMCC建倉建議</i>"
+
+        await status_msg.edit_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        if ib and ib.isConnected():
+            ib.disconnect()
+        await status_msg.edit_text(_ibkr_err(e), parse_mode="HTML")
+
+
 async def register_bot_commands(application: Application) -> None:
     """Publish Telegram slash-command menu for clients that show bot commands."""
     await application.bot.set_my_commands([
@@ -3257,9 +3775,10 @@ async def register_bot_commands(application: Application) -> None:
         BotCommand("greeks", "Portfolio greeks: delta / gamma / theta / vega"),
         BotCommand("iv", "IV rank + 52w IV history: /iv <symbol>"),
         BotCommand("attribution", "P&L breakdown by put/call/roll/stock"),
-        BotCommand("whatif", "Simulate close impact on margin: /whatif <symbol>"),
         BotCommand("leaps", "Suggest best LEAPS call for PMCC: /leaps <symbol>"),
         BotCommand("buy_leaps", "Place LEAPS call buy order: /buy_leaps <symbol> <YYYYMMDD> <strike>"),
+        BotCommand("wheel_check", "Scan Wheel gaps: missing CC, PMCC, ITM alerts, DTE/PnL triggers"),
+        BotCommand("nav", "NAV reconciliation: stock/option/cash vs initial fund"),
     ])
     logger.info("Registered Telegram bot command menu")
 
@@ -3311,11 +3830,12 @@ def start_bot(cfg_path: str) -> None:
     application.add_handler(CommandHandler("greeks", greeks_command))
     application.add_handler(CommandHandler("iv", iv_command))
     application.add_handler(CommandHandler("attribution", attribution_command))
-    application.add_handler(CommandHandler("whatif", whatif_command))
     application.add_handler(CommandHandler("leaps", leaps_command))
     application.add_handler(CommandHandler("buy_leaps", buy_leaps_command))
     application.add_handler(CommandHandler("cancel_order", cancel_order_command))
     application.add_handler(CommandHandler("modify_order", modify_order_command))
-    
+    application.add_handler(CommandHandler("wheel_check", wheel_check_command))
+    application.add_handler(CommandHandler("nav", nav_command))
+
     print(f"Starting ThetaGang Telegram Bot for account {config.runtime.account.number}...")
     application.run_polling()
