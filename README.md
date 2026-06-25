@@ -1,63 +1,361 @@
-# Θ ThetaGang (Mactone Fork with Telegram Bot) Θ
+# ThetaGang — Wheel / PMCC Automated Income Bot (Mactone Fork)
 
-這個分支新增了與 `deribit-thetagang` 相似的 **Telegram Bot 操控與動態管理功能**，方便隨時掌握帳戶狀況與手動風控。
+This fork adds a full **Telegram control interface** to the upstream ThetaGang project: real-time monitoring, live config edits, position management, and detailed income dashboards — all without touching the server.
+
+The container bundles IB Gateway (via IBC), the hourly trading engine, and the Telegram bot daemon into one Docker image.
 
 ---
 
-## 🚀 快速開始：透過 Docker 建置與啟動
+## Prerequisites
 
-### 1. 本地建置 Docker 鏡像
-由於 Dockerfile 會將本地打包好的 wheel 安裝進鏡像中，在建置前需要先打包：
+| Requirement | Notes |
+|---|---|
+| Docker ≥ 24 | IB Gateway + IBC bundled inside; no separate install needed |
+| IBKR account | Paper or live; API access must be enabled |
+| Telegram bot | Create via [@BotFather](https://t.me/BotFather); need `bot_token` and your `chat_id` |
+
+---
+
+## Clone to Running — Step by Step
+
+### 1. Clone the repo
+
 ```bash
-# 使用 uv 打包 (推薦)
+git clone https://github.com/mactone/thetagang.git
+cd thetagang
+```
+
+### 2. Build the Python package (required before Docker build)
+
+The Dockerfile installs from a local `.whl` file. Build it first:
+
+```bash
+pip install uv
 uv build
+```
 
-# 或使用 python 官方 build 工具
-pip install build && python -m build
+This creates `dist/thetagang-*.whl`.
 
-# 接著建置 Docker 鏡像
+### 3. Create your config files (these are gitignored — never committed)
+
+**`thetagang.toml`** — main config. Minimum required fields:
+
+```toml
+[account]
+account = "YOUR_ACCOUNT_ID"       # e.g. U1234567 (live) or DU1234567 (paper)
+cancel_orders = true
+market_data_type = 1              # 1=live, 3=delayed/free
+
+[ibc]
+userid      = "YOUR_TWS_USERNAME"
+password    = "YOUR_TWS_PASSWORD"
+tradingMode = "paper"             # "paper" or "live"
+
+[telegram]
+enabled   = true
+bot_token = "YOUR_BOT_TOKEN"
+chat_id   = "YOUR_CHAT_ID"
+password  = "YOUR_BOT_PASSWORD"   # prevents strangers from using the bot
+
+[thetagang]
+minimum_credit = 0.10             # skip orders below $0.10 credit/share
+
+[roll_when]
+pnl          = 0.50   # roll when position reaches 50% of max profit
+dte          = 7      # or when ≤ 7 DTE remain
+close_at_pnl = 0.90  # close outright (no roll) at 90% profit
+
+[symbols.TSLA]
+weight = 0.50
+# add more symbols with weights summing to 1.0
+```
+
+**`ibc-config.ini`** — IBC login automation. Copy from [`ibc-config.ini`](ibc-config.ini) in the repo and set `TradingMode=paper` or `TradingMode=live`.
+
+### 4. Build and start the container
+
+```bash
+./run_docker.sh
+```
+
+This builds the image, removes any old container, and starts a fresh one. Manually:
+
+```bash
 docker build -t thetagang .
-```
 
-### 2. 啟動交易機器人 (Trading Bot)
-掛載包含 `thetagang.toml` 的設定檔目錄，並執行交易邏輯（由外部排程如 cron 每 30 分鐘執行一次）：
-```bash
-docker run --rm -i \
-  -v /path/to/local/thetagang/config:/etc/thetagang \
-  thetagang \
-  --config /etc/thetagang/thetagang.toml
-```
-
-### 3. 啟動 Telegram Bot 背景守護進程 (Telegram Bot Daemon)
-Telegram Bot 需要持續在背景運行以接收指令，請使用 `-d` 在背景啟動並傳入 `--bot` 參數：
-```bash
 docker run -d --name thetagang-bot \
-  -v /path/to/local/thetagang/config:/etc/thetagang \
+  --restart unless-stopped \
+  -v "$PWD/thetagang.toml:/etc/thetagang/thetagang.toml" \
+  -v "$PWD/ibc-config.ini:/etc/thetagang/ibc-config.ini" \
+  -v "$PWD/data:/etc/thetagang/data" \
   thetagang \
   --config /etc/thetagang/thetagang.toml --bot
 ```
 
+### 5. Verify startup
+
+```bash
+docker logs -f thetagang-bot
+```
+
+Expected sequence:
+1. Xvfb virtual display starts
+2. IBC daemon launches IB Gateway (30–120 s on first boot)
+3. `"TWS is ready on port 7497"`
+4. Trading engine runs first cycle
+5. Telegram bot starts → you receive `⚡ ThetaGang container started`
+
+Send `/status` to your bot to confirm it responds.
+
 ---
 
-## 🛠️ 修改項目與功能說明
+## Trading Schedule
 
-### 1. 修改項目
-- **新增 Telegram 支援**：在 `thetagang.toml` 的 `[runtime.telegram]` 區塊配置 Token 與 Chat ID。
-- **動態交易開關**：引入動態暫停狀態機制。使用 `/pause` 與 `/resume` 指令會動態寫入 `telegram_bot_state.json`。主交易程式執行時會自動載入該狀態，無須重啟容器或修改 TOML 設定檔。
-- **CLI 模式切換**：新增 `--bot` 啟動參數，用於啟用長連接的 Telegram Bot。
-- **依賴升級**：`pyproject.toml` 中新增 `python-telegram-bot` 依賴。
+Engine runs every hour during the **market-near window** only:
 
-### 2. Telegram Bot 指令說明
-| 指令 | 說明 |
-|------|------|
-| `/start` | 顯示 Bot 指令選單 |
-| `/status` | 顯示即時 Net Liquidation、可用現金、保證金需求與 Cushion 比例 |
-| `/positions` | 列出目前所有股票與期權持倉，附帶 conId、成本、市值與未實現盈虧 |
-| `/trades` | 查詢 SQLite 資料庫，顯示最近 30 筆交易成交紀錄 |
-| `/strategy` | 顯示各標的的權重分配以及當前是否被暫停交易 |
-| `/pause <symbol\|all>` | 暫停單一標的或全域自動交易 |
-| `/resume <symbol\|all>` | 恢復單一標的或全域自動交易 |
-| `/close <conId\|symbol>` | 發送市價單手動平倉指定持倉 |
+- **Mon–Fri 13:00–21:00 UTC** (NYSE 13:30–20:00 UTC; 30-min buffer each side)
+- Outside this window, the engine sleeps silently until next opening
+
+---
+
+## Updating Code Without Full Rebuild
+
+The container bakes Python packages into `/opt/venv/` — host source edits do NOT take effect after a restart. Two paths:
+
+**Quick patch (single file):**
+```bash
+docker cp thetagang/telegram_bot.py thetagang-bot:/opt/venv/lib/python3.14/site-packages/thetagang/telegram_bot.py
+docker stop thetagang-bot && docker start thetagang-bot
+```
+
+**Full rebuild (structural changes):**
+```bash
+uv build && ./run_docker.sh
+```
+
+---
+
+## Telegram Command Reference
+
+### Status & Overview
+
+| Command | Description |
+|---|---|
+| `/0start` | Quick overview — essential status commands only |
+| `/start` | Full command help menu |
+| `/status` | Account summary: NAV, net liquidation, cash, margin usage |
+| `/positions` | All open positions with Greeks, cost basis, unrealized P&L |
+| `/trades` | Executions from the last 3 days |
+| `/orders` | Live open orders at the broker (detailed) |
+
+### Income & P&L Tracking
+
+| Command | Description |
+|---|---|
+| `/revenue` | **Monthly Premium Ledger** — realized net income + pending open positions |
+| `/pnl` | Realized option premium: today / week / month / YTD |
+| `/attribution` | P&L by category: put premium / call premium / roll cost / stock gain-loss |
+
+### Position Analysis
+
+| Command | Description |
+|---|---|
+| `/expirations` | Upcoming option expirations in the next 60 days |
+| `/theta` | Daily theta (time decay) per position in dollars |
+| `/greeks` | Portfolio-level Greeks: delta / gamma / theta / vega |
+| `/iv <symbol>` | IV rank + 52-week IV history |
+| `/wheel_check` | Scan for gaps: missing CC, PMCC opportunities, ITM alerts, DTE/PnL triggers |
+| `/nav` | NAV reconciliation: stock + option + cash vs initial fund |
+
+### PMCC / LEAPS
+
+| Command | Description |
+|---|---|
+| `/leaps <symbol>` | Suggest best LEAPS call strike for PMCC |
+| `/buy_leaps <symbol> <YYYYMMDD> <strike>` | Place a LEAPS call buy order (e.g. `/buy_leaps NVDA 20270115 170`) |
+
+### Live Strategy Edits
+
+| Command | Description |
+|---|---|
+| `/strategy` | Current symbol weights and pause status |
+| `/settings` | Margin limits, delta targets, cash/SGOV allocation, hedge settings |
+| `/set_weight <symbol> <percent>` | Draft a new target weight (e.g. `/set_weight TSLA 40`) |
+| `/set_no_trading <symbol> <true\|false>` | Draft a trading block for a symbol |
+| `/preview_config` | Show pending config changes as a diff before applying |
+| `/apply_config` | Commit pending changes into `thetagang.toml` |
+| `/discard_config` | Discard pending config draft |
+| `/reload_strategy` | Reload current TOML into the running Telegram daemon |
+
+### Pause / Resume
+
+| Command | Description |
+|---|---|
+| `/pause <symbol\|all>` | Pause new trades for a symbol (or all) |
+| `/resume <symbol\|all>` | Resume trading for a paused symbol (or all) |
+
+### Order Management
+
+| Command | Description |
+|---|---|
+| `/close <conId\|symbol>` | Submit a closing order for a position |
+| `/cancel_order <orderId>` | Cancel an open order |
+| `/modify_order <orderId> <newPrice>` | Change the limit price of an open order |
+
+### History & Diagnostics
+
+| Command | Description |
+|---|---|
+| `/history [N]` | Last N trading engine run summaries (default: 5) |
+| `/events [symbol]` | Recent engine decision events, optionally filtered by symbol |
+
+---
+
+## How to Interpret Telegram Output
+
+### `/revenue` — Monthly Premium Ledger
+
+```
+📊 Monthly Premium Ledger
+2025-03   Realized: $XXX    Pending: $XXX
+2025-04   Realized: $XXX    Pending: $XXX
+...
+Realized Avg/mo: $1,541.75
+ℹ️ 已實現=IBKR稅務成本淨損益（含roll成本）；未平倉=原始收取premium待結算。
+```
+
+| Column | Source | Use for planning? |
+|---|---|---|
+| **Realized** | `executions.realized_pnl` — IBKR tax-lot net P&L on closed positions | **Yes** — actual spendable cash, roll costs already deducted |
+| **Pending** | Gross credit on still-open positions | No — outcome unknown until position closes |
+| **Realized Avg/mo** | Monthly average of Realized only | **Yes** — your baseline monthly income |
+
+> Do NOT plan cash flow from Pending figures. A position may roll (paying a debit) or get assigned, changing the final P&L entirely.
+
+### `/nav` — NAV Reconciliation
+
+```
+📊 NAV Reconciliation
+Stock value:   $XX,XXX
+Option value:  $XX,XXX   (LEAPS + short options mark-to-market)
+Cash:          $XX,XXX
+───────────────────────
+Total NAV:     $XX,XXX
+Initial fund:  $XX,XXX
+Change:        +$X,XXX (+X.X%)
+```
+
+**Why NAV change ≠ premium collected:**
+Selling an option increases cash but creates a short option liability (negative mark-to-market) that partially offsets it. NAV only improves as the option decays toward zero. Additionally, unrealized stock/LEAPS losses subtract directly from NAV regardless of premium income.
+
+Example bridge: collect $14,896 gross premium; LEAPS and stock positions decline $8,649 unrealized → NAV up only ~$6,247.
+
+### `/pnl` — Quick P&L Summary
+
+```
+Today:   $XX.XX
+Week:    $XXX.XX
+Month:   $XXX.XX
+YTD:     $X,XXX.XX
+```
+
+Same `realized_pnl` source as `/revenue`. Roll costs already deducted. Safe to use for cash flow.
+
+### `/positions` — Open Positions
+
+Each row: symbol · type (stock/put/call/LEAPS) · expiry · strike · qty · cost basis · current value · unrealized P&L · delta.
+
+ITM shorts are highlighted — check `/wheel_check` for actionable flags.
+
+### `/wheel_check` — Gap Scanner
+
+| Flag | Meaning |
+|---|---|
+| `Missing CC` | Own stock but no covered call written |
+| `Missing PMCC` | Have LEAPS but no short call against it |
+| `ITM` | Short put/call is in-the-money (assignment risk) |
+| `DTE trigger` | Position within `roll_when.dte` days of expiry |
+| `PnL trigger` | Position reached `roll_when.pnl` profit threshold |
+
+### `/attribution` — P&L by Category
+
+```
+Put premium:   +$X,XXX
+Call premium:  +$X,XXX
+Roll cost:     -$XXX
+Stock P&L:     -$X,XXX
+Net total:     +$X,XXX
+```
+
+Useful to see whether income is being eroded by roll costs or stock drag.
+
+---
+
+## Key Metric Guide
+
+| Metric | Spendable? | Notes |
+|---|---|---|
+| `/revenue` Realized | **Yes** | IBKR net P&L, roll costs deducted |
+| `/pnl` YTD | **Yes** | Same source |
+| `/revenue` Pending | No | Open position; outcome unknown |
+| Gross SLD cashflow | No | Includes roll debits not yet netted |
+| NAV change | No | Includes unrealized stock swings |
+
+---
+
+## Roll Logic
+
+Configured in `[roll_when]`:
+
+```
+pnl          = 0.50   → roll when 50% of max profit reached
+dte          = 7      → or ≤ 7 days to expiry
+close_at_pnl = 0.90  → close outright at 90% (no roll)
+minimum_credit = 0.10 → skip orders < $0.10/share credit
+```
+
+The engine checks every cycle (hourly during market hours) and submits limit orders automatically.
+
+---
+
+## Backtest Scripts
+
+Read-only analytical scripts (no IBKR connection):
+
+| Script | Purpose |
+|---|---|
+| `backtest_current_params_10y.py` | 10-year NAV curve with current weights |
+| `backtest_conservative_compare.py` | Compare current vs conservative vs defensive-income |
+| `estimate_call_put_premiums.py` | Estimate put + call premium yield across scenarios |
+
+```bash
+pip install numpy pandas yfinance scipy matplotlib
+python backtest_current_params_10y.py
+# output → ./output/backtest/  (or $THETAGANG_OUT_DIR)
+```
+
+---
+
+## Data Files (gitignored)
+
+| File | Contents |
+|---|---|
+| `data/thetagang.db` | SQLite: executions, positions, orders, NAV snapshots |
+| `data/telegram_fill_monitor_state.json` | Last-seen execution IDs for fill notifications |
+| `thetagang.toml` | Secrets: IBKR account, IBC credentials, Telegram token |
+| `ibc-config.ini` | IBC automation credentials |
+
+---
+
+## Troubleshooting
+
+**Bot not responding:** `docker logs thetagang-bot | tail -50`
+
+**Code changes not taking effect:** Use `docker cp` + stop/start, or rebuild with `./run_docker.sh`. Editing source files on the host has no effect on the running container.
+
+**TWS port 7497 not ready:** IBC takes 60–120 s on first boot. Check logs for `"TWS is ready"`.
+
+**Order skipped (below minimum_credit):** Adjust `minimum_credit` in `thetagang.toml`.
 
 ---
 
