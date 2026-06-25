@@ -79,6 +79,97 @@ logging.getLogger("ib_async.ib").setLevel(logging.ERROR)
 logging.getLogger("ib_async.wrapper").setLevel(logging.CRITICAL)
 
 
+def _mmdd_to_month_day(mmdd: str) -> str:
+    """Convert 4-digit MMDD string to 'Mon D' format, e.g. '0710' → 'Jul 10'."""
+    try:
+        from datetime import datetime
+
+        return datetime.strptime(mmdd, "%m%d").strftime("%b %-d")
+    except Exception:
+        return mmdd
+
+
+def _format_order_line(contract: Contract, order: Any) -> str:
+    """Return (line, roll_detail) where roll_detail is non-empty only for BAG combos."""
+    lmt = float(order.lmtPrice or 0)
+    action = str(getattr(order, "action", ""))
+    if lmt == 0:
+        price_str = "MKT"
+    elif lmt < 0 or action == "SELL":
+        price_str = f"<b>credit ${abs(lmt):.2f}</b>"
+    else:
+        price_str = f"debit ${lmt:.2f}"
+
+    sec_type = getattr(contract, "secType", "")
+    qty = int(order.totalQuantity)
+    sym = contract.symbol
+
+    if sec_type == "BAG":
+        roll_detail = ""
+        order_ref = str(getattr(order, "orderRef", "") or "")
+        # Parse "close:C138@0710|open:C138@0717" from orderRef
+        try:
+            parts = dict(p.split(":", 1) for p in order_ref.split("|") if ":" in p)
+            close_raw = parts.get("close", "")
+            open_raw = parts.get("open", "")
+            if close_raw and open_raw:
+                # e.g. "C138@0710" → right="C", strike="138", mmdd="0710"
+                def _parse_leg(s: str) -> str:
+                    right, rest = s[0], s[1:]
+                    strike, mmdd = rest.split("@")
+                    return f"{right}{strike} {_mmdd_to_month_day(mmdd)}"
+
+                roll_detail = f"↳ {_parse_leg(close_raw)} → {_parse_leg(open_raw)}"
+        except Exception:
+            pass
+        line = f"• {action} {qty} <b>{sym}</b> [Roll] {price_str}"
+        if roll_detail:
+            line = f"{line}\n  <i>{roll_detail}</i>"
+        return line
+
+    elif sec_type == "OPT":
+        right = getattr(contract, "right", "")
+        strike = getattr(contract, "strike", "")
+        expiry_raw = getattr(contract, "lastTradeDateOrContractMonth", "")
+        try:
+            from datetime import datetime
+
+            expiry_short = datetime.strptime(expiry_raw[:8], "%Y%m%d").strftime("%b %-d")
+        except Exception:
+            expiry_short = expiry_raw
+        right_str = "Put" if str(right).startswith("P") else "Call"
+        return f"• {action} {qty} <b>{sym}</b> [{right_str}] {price_str} <i>${strike} {expiry_short}</i>"
+
+    elif sec_type == "STK":
+        return f"• {action} {qty} <b>{sym}</b> [Stock] {price_str}"
+
+    else:
+        label = f"[{sec_type}]" if sec_type else ""
+        return f"• {action} {qty} <b>{sym}</b> {label} {price_str}"
+
+
+def _build_order_notification(trades: list) -> str:
+    """Build Telegram notification grouping combo rolls separately from single-leg orders."""
+    single_lines: list[str] = []
+    combo_lines: list[str] = []
+
+    for trade in trades:
+        line = _format_order_line(trade.contract, trade.order)
+        if getattr(trade.contract, "secType", "") == "BAG":
+            combo_lines.append(line)
+        else:
+            single_lines.append(line)
+
+    parts = ["🔔 <b>ThetaGang 下單通知 (Order Placed)</b>"]
+    if single_lines:
+        parts.append("📝 <b>單腿訂單</b>")
+        parts.extend(single_lines)
+    if combo_lines:
+        parts.append("🔄 <b>Combo Roll</b>")
+        parts.extend(combo_lines)
+    return "\n".join(parts)
+
+
 class PortfolioManager:
     @staticmethod
     def get_close_price(ticker: Ticker) -> float:
@@ -773,15 +864,7 @@ class PortfolioManager:
                 try:
                     placed_trades = self.trades.records()
                     if placed_trades:
-                        lines = ["🔔 <b>ThetaGang 下單通知 (Order Placed)</b>"]
-                        for trade in placed_trades:
-                            contract = trade.contract
-                            order = trade.order
-                            lines.append(
-                                f"• {order.action} {order.totalQuantity} <b>{contract.symbol}</b> "
-                                f"@ ${order.lmtPrice or 'MKT'} (Ref: {order.orderRef or '-'})"
-                            )
-                        message = "\n".join(lines)
+                        message = _build_order_notification(placed_trades)
                         send_telegram_notification(self.config, message)
                 except Exception as exc:
                     log.warning(f"Failed to generate Telegram order notification: {exc}")
@@ -1084,6 +1167,35 @@ class PortfolioManager:
             self.trades.submit_order(contract, order, intent_id=intent_id)
         self.trades.print_summary()
 
+    async def _get_bag_midpoint(self, contract: Contract) -> Optional[float]:
+        """Compute midpoint for a BAG combo contract from its individual legs.
+
+        IB does not populate bid/ask for BAG contracts via reqMktData, so
+        requesting the ticker midpoint directly always returns NaN. Instead,
+        fetch each leg's midpoint and apply the leg action sign (BUY=+1, SELL=-1).
+        """
+        if not contract.comboLegs:
+            return None
+        total_mid = 0.0
+        for leg in contract.comboLegs:
+            leg_contract = Contract(conId=leg.conId, exchange=leg.exchange or "SMART")
+            try:
+                leg_ticker = await asyncio.wait_for(
+                    self.ibkr.get_ticker_for_contract(
+                        leg_contract,
+                        required_fields=[TickerField.MIDPOINT],
+                    ),
+                    timeout=self.config.runtime.ib_async.api_response_wait_time,
+                )
+            except (asyncio.TimeoutError, RuntimeError, RequiredFieldValidationError):
+                return None
+            leg_mid = leg_ticker.midpoint()
+            if util.isNan(leg_mid):
+                return None
+            sign = 1.0 if leg.action == "BUY" else -1.0
+            total_mid += sign * leg_mid
+        return total_mid
+
     async def adjust_prices(self) -> None:
         if (
             all(
@@ -1117,15 +1229,25 @@ class PortfolioManager:
 
         for idx, trade in unfilled:
             try:
-                # Bound midpoint price requests so repricing never blocks run termination.
-                ticker = await asyncio.wait_for(
-                    self.ibkr.get_ticker_for_contract(
-                        trade.contract,
-                        required_fields=[TickerField.MIDPOINT],
-                        optional_fields=[TickerField.MARKET_PRICE],
-                    ),
-                    timeout=self.config.runtime.ib_async.api_response_wait_time,
-                )
+                if trade.contract.secType == "BAG":
+                    # IB does not return bid/ask for combo BAG contracts via reqMktData.
+                    # Compute midpoint from individual legs (same approach as initial pricing).
+                    mid_price = await self._get_bag_midpoint(trade.contract)
+                    if mid_price is None or util.isNan(mid_price):
+                        raise RuntimeError(
+                            f"No midpoint available from legs for BAG {trade.contract.symbol}"
+                        )
+                else:
+                    # Bound midpoint price requests so repricing never blocks run termination.
+                    ticker = await asyncio.wait_for(
+                        self.ibkr.get_ticker_for_contract(
+                            trade.contract,
+                            required_fields=[TickerField.MIDPOINT],
+                            optional_fields=[TickerField.MARKET_PRICE],
+                        ),
+                        timeout=self.config.runtime.ib_async.api_response_wait_time,
+                    )
+                    mid_price = ticker.midpoint()
 
                 (contract, order) = (trade.contract, trade.order)
                 updated_price = np.sign(float(order.lmtPrice or 0)) * max(
@@ -1138,7 +1260,7 @@ class PortfolioManager:
                         ),
                         math.fabs(
                             round(
-                                (float(order.lmtPrice or 0) + ticker.midpoint()) / 2.0,
+                                (float(order.lmtPrice or 0) + mid_price) / 2.0,
                                 2,
                             )
                         ),

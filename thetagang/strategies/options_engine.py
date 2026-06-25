@@ -1244,12 +1244,23 @@ class OptionsStrategyEngine:
                     exchange=self.order_ops.get_order_exchange(),
                     comboLegs=combo_legs,
                 )
+                # Encode roll leg details into orderRef for notifications/DB tracking.
+                # Format: "close:{right}{strike}@{MMDD}|open:{right}{strike}@{MMDD}"
+                from_c = position.contract
+                to_c = sell_ticker.contract
+                _roll_ref = (
+                    f"close:{from_c.right}{int(from_c.strike)}"
+                    f"@{from_c.lastTradeDateOrContractMonth[4:8]}"
+                    f"|open:{to_c.right}{int(to_c.strike)}"
+                    f"@{to_c.lastTradeDateOrContractMonth[4:8]}"
+                )
                 order = self.order_ops.create_limit_order(
                     action="BUY",
                     quantity=qty_to_roll,
                     limit_price=round(price, 2),
                     use_default_algo=False,
                     transmit=True,
+                    order_ref=_roll_ref,
                 )
 
                 to_dte = option_dte(sell_ticker.contract.lastTradeDateOrContractMonth)

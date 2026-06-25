@@ -346,10 +346,16 @@ class TestPortfolioManager:
         portfolio_manager.config.runtime.orders.price_update_delay = (1, 2)
         portfolio_manager.config.runtime.orders.minimum_credit = 0.01
 
+        leg = mocker.Mock()
+        leg.conId = 12345
+        leg.exchange = "SMART"
+        leg.action = "BUY"
+
         trade = mocker.Mock()
         trade.contract = mocker.Mock(symbol="QQQ")
         trade.contract.symbol = "QQQ"
         trade.contract.secType = "BAG"
+        trade.contract.comboLegs = [leg]
         trade.order = mocker.Mock(lmtPrice=-1.25, action="BUY", totalQuantity=1)
         trade.orderStatus = mocker.Mock(status="Submitted", filled=0.0, remaining=1.0)
         trade.isDone.return_value = False
@@ -364,6 +370,7 @@ class TestPortfolioManager:
         portfolio_manager.ibkr.wait_for_orders_complete = mocker.AsyncMock(
             return_value=[trade]
         )
+        # Leg ticker request times out → _get_bag_midpoint returns None → skips repricing
         portfolio_manager.ibkr.get_ticker_for_contract = mocker.AsyncMock(
             side_effect=asyncio.TimeoutError()
         )
@@ -371,6 +378,63 @@ class TestPortfolioManager:
         await portfolio_manager.adjust_prices()
 
         portfolio_manager.ibkr.get_ticker_for_contract.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_adjust_prices_reprices_bag_combo_from_legs(
+        self, portfolio_manager, mocker
+    ):
+        """BAG contracts compute midpoint from individual legs and reprice toward fill."""
+        portfolio_manager.config.runtime.orders.price_update_delay = (1, 2)
+        portfolio_manager.config.runtime.orders.minimum_credit = 0.01
+
+        buy_leg = mocker.Mock()
+        buy_leg.conId = 111
+        buy_leg.exchange = "SMART"
+        buy_leg.action = "BUY"
+
+        sell_leg = mocker.Mock()
+        sell_leg.conId = 222
+        sell_leg.exchange = "SMART"
+        sell_leg.action = "SELL"
+
+        trade = mocker.Mock()
+        trade.contract = mocker.Mock(symbol="PLTR")
+        trade.contract.symbol = "PLTR"
+        trade.contract.secType = "BAG"
+        trade.contract.comboLegs = [buy_leg, sell_leg]
+        trade.order = mocker.Mock(lmtPrice=-0.15, action="BUY", totalQuantity=1)
+        trade.orderStatus = mocker.Mock(status="Submitted", filled=0.0, remaining=1.0)
+        trade.isDone.return_value = False
+
+        portfolio_manager.trades = mocker.Mock()
+        portfolio_manager.trades.records = mocker.Mock(return_value=[trade])
+        portfolio_manager.trades.is_empty = mocker.Mock(return_value=False)
+        portfolio_manager.trades.submit_order = mocker.Mock()
+
+        portfolio_manager.config.portfolio.symbols = {
+            "PLTR": mocker.Mock(adjust_price_after_delay=True)
+        }
+        portfolio_manager.ibkr.wait_for_orders_complete = mocker.AsyncMock(
+            return_value=[trade]
+        )
+
+        # buy leg mid=$0.20, sell leg mid=$0.30 → bag mid = 0.20 - 0.30 = -0.10
+        # repricing: round((-0.15 + -0.10)/2, 2) = -0.12 (moves toward market, less credit)
+        buy_ticker = mocker.Mock(spec=Ticker)
+        buy_ticker.midpoint.return_value = 0.20
+        sell_ticker = mocker.Mock(spec=Ticker)
+        sell_ticker.midpoint.return_value = 0.30
+
+        portfolio_manager.ibkr.get_ticker_for_contract = mocker.AsyncMock(
+            side_effect=[buy_ticker, sell_ticker]
+        )
+
+        await portfolio_manager.adjust_prices()
+
+        call_args = portfolio_manager.trades.submit_order.call_args
+        assert call_args is not None
+        submitted_order = call_args[0][1]
+        assert submitted_order.lmtPrice == -0.12
 
     @pytest.mark.asyncio
     async def test_write_calls_respects_can_write_when_green_with_nan_close(
